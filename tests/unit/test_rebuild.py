@@ -158,7 +158,7 @@ def test_emitted_certificate_names_a_root_the_subject_is_really_gone_from(built,
     """Guards against a root computed before the purge -- which would verify
     cleanly while proving absence from a set the model never trained on."""
     from nacl.signing import SigningKey
-    from verify.merkle import build_root
+    from verify.smt import build_root
 
     monkeypatch.setenv("UNLEARNSHIELD_SIGNING_KEY", bytes(SigningKey.generate()).hex())
     routing, _ = built

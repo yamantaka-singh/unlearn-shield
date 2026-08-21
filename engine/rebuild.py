@@ -21,7 +21,7 @@ from config.settings import (BATCH_SIZE, CODE_DIGEST, EPOCHS_PER_SLICE, LEARNING
 from engine.train import (checkpoint_path, load_routing, load_shard, save_shard,
                           train_shard)
 from verify import manifest as manifest_mod
-from verify.merkle import build_root, prove_absence
+from verify.smt import build_root, prove_absence
 from verify.sign import sign_manifest
 
 

@@ -1,194 +1,320 @@
+<div align="center">
+
 # UnlearnShield
 
-Machine unlearning for tabular fraud models. When a record has to come out of a
-trained model — a poisoned batch, a fraud ring's history, a revoked consent —
-UnlearnShield rebuilds only the affected shard and emits a signed manifest that
-an auditor can check without access to the training system.
+**Provable machine unlearning for tabular fraud models.**
 
-It uses SISA (sharded, isolated, sliced training), so removal is structural
-rather than statistical: the retrained shard is a function of its retained data,
-not a model nudged away from the deleted rows by gradient ascent.
+Remove a subject from a trained model and get back a signed certificate
+an auditor can verify — without access to your training system, your
+database, or your weights.
 
-**Status: Phase 4 of 7.** Determinism harness, offline unlearning engine, and
-verification layer are built. The gateway and worker are now built too — an
-erasure request goes in over HTTP, gets processed asynchronously by a
-Postgres-queued worker, and comes back out as a certificate a standalone
-verifier accepts, with `/v1/predict` reflecting the change. The dashboard is
-not built. See [docs/implementation-plan.md](docs/implementation-plan.md) for
-the full build plan and [docs/plan-corrections.md](docs/plan-corrections.md)
-for defects found in it.
+[![tests](https://img.shields.io/badge/tests-144_passing-2ea043?style=flat-square)](#testing)
+[![p99](https://img.shields.io/badge/predict_p99-9.8ms-2ea043?style=flat-square)](#serving-latency)
+[![proof leak](https://img.shields.io/badge/subjects_leaked_per_proof-0-2ea043?style=flat-square)](#absence-proofs-that-name-nobody)
+[![python](https://img.shields.io/badge/python-3.11-3776ab?style=flat-square)](https://www.python.org)
+[![licence](https://img.shields.io/badge/licence-MIT-blue?style=flat-square)](LICENSE)
 
-## What is actually here
+</div>
+
+---
+
+## The problem
+
+GDPR Article 17 and DPDP say a subject can demand erasure. Fraud teams need to
+excise a poisoned batch or a ring's history. Both mean the same thing
+technically: **remove a subject's influence from a trained model, and be able
+to show you did.**
+
+Gradient-ascent "unlearning" nudges a model away from deleted rows. It gives a
+probabilistic guarantee, and an auditor cannot check it at all. *Probably
+forgot* is not an answer.
+
+## The approach
+
+SISA — sharded, isolated, sliced training. Removal is **structural**: the
+retrained shard is a function of its retained data, full stop.
 
 ```
-config/determinism.py    the harness everything downstream depends on
-config/settings.py       env-driven config, subject_ref HMAC, auth token map
-data/synth.py             PaySim-shaped generator (real CSV drops in unchanged)
-data/churn_score.py       PLACEHOLDER churn signal, clearly marked as invented
-engine/sharder.py         hot/cold shard assignment, frozen at ingest
-engine/slicer.py          subject-aligned slices, churn-ordered
-engine/preprocessing.py   per-shard constants, fit on slice 0 only
-engine/model.py           fixed MLP, identical across shards
-engine/train.py           build + incremental slice training with checkpoints
-engine/rebuild.py         purge, roll back, retrain forward, emit a certificate
-verify/merkle.py          RFC 6962 tree, non-inclusion proofs
-verify/manifest.py        canonical serialisation
-verify/sign.py            Ed25519
-verify/verifier_cli.py    standalone auditor tool, imports nothing from engine/
-gateway/                  stateless FastAPI app -- never trains
-  auth.py                 bearer-token -> scope map, no user accounts
-  idempotency.py          INSERT ... ON CONFLICT, no check-then-insert race
-  routes/erasure.py       202 intake, status, certificate, attest
-  routes/predict.py       sequential shard ensemble, model_version in every response
-  routes/models.py        current model_version, manifest lookup by version
-worker/                   separate deployment, no ingress -- never serves
-  queue.py                claim-then-commit, lease + reaper
-  jobs.py                 batch rebuild per shard, promote, spot-check sampling
-scripts/load_routing.py   loads engine/'s offline routing.json into Postgres
-db/schema.sql             full DDL
-tests/unit/               91 tests, no DB required
-tests/integration/        18 tests, real Postgres required (skip cleanly without it)
-tests/e2e/                1 test: full lifecycle over real HTTP + real Postgres
-docs/adr/                 decision records
+   subjects ──┬── shard 0 ──┬─ slice 0 ─┬─ slice 1 ─┬─ slice 2 ─┬─ slice 3 ─┬─ slice 4
+              │             │           │           │           │           │
+              │            ckpt        ckpt        ckpt        ckpt        ckpt
+              ├── shard 1 ── …
+              ├── shard 2 ── …          ▲                                    ▲
+              ├── shard 3 ── …          │                                    │
+              └── shard 4 ── …     erase here                          erase here
+                                   = retrain 4/5                       = retrain 1/5
+                                     of the shard                        of the shard
+
+   erasure request ──▶ purge rows ──▶ roll back to checkpoint ──▶ retrain forward
+                                                                        │
+                                         signed certificate ◀───────────┘
 ```
 
-## Run it
+Shards are assigned by churn likelihood, and slices are ordered so the subjects
+most likely to be erased land in the **last** slice, where rollback is
+cheapest. Erasing a slice-4 subject retrains one fifth of one shard. That
+spread is the entire point.
+
+---
+
+## Quick start
 
 ```bash
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements-dev.txt
 
-# Unit tests need no database
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 125 tests, no database
 ```
 
-`PYTHONHASHSEED` can only be set before the interpreter starts, so the harness
-refuses to run without it. Docker and CI set it for you.
+`PYTHONHASHSEED` must be set before the interpreter starts, so the determinism
+harness refuses to run without it. Docker and CI set it for you.
 
-## Build a corpus, erase someone, serve a prediction
+<details>
+<summary><b>Full stack — build a model, erase someone, verify the certificate</b></summary>
 
 ```bash
-docker compose up -d postgres   # port 55432 on the host -- 5432 is often taken
-                                 # by a native Postgres install; the internal
-                                 # container-to-container URL still uses 5432
+docker compose up -d postgres     # host port 55432; 5432 is usually taken by a
+                                  # native install. Container-to-container stays 5432.
 
 export DATABASE_URL="postgresql://unlearnshield:unlearnshield@localhost:55432/unlearnshield"
 export PYTHONHASHSEED=0
-.venv/bin/python -m verify.sign                     # dev keypair, once
+.venv/bin/python -m verify.sign                       # dev keypair, once
 export UNLEARNSHIELD_SIGNING_KEY=$(cat .signing_key)
 
-.venv/bin/python -m engine.train --build            # partition + train 5 shards
-.venv/bin/python -m scripts.load_routing            # load routing + baseline into Postgres
+.venv/bin/python -m engine.train --build              # partition + train 5 shards
+.venv/bin/python -m scripts.load_routing              # routing + baseline → Postgres
 
 .venv/bin/python -m uvicorn gateway.main:app --port 8000 &
-.venv/bin/python -m worker.main                     # separate process, polls the queue
+.venv/bin/python -m worker.main &                     # separate process, polls the queue
 
 curl -X POST localhost:8000/v1/erasure \
-  -H "Authorization: Bearer dev-token" -H "Idempotency-Key: demo-1" \
+  -H "Authorization: Bearer dev-token" \
+  -H "Idempotency-Key: demo-1" \
   -H "content-type: application/json" \
   -d '{"subject_id": "C0000042", "reason": "fraud_excision"}'
-# {"erasure_id": "...", "status": "queued", "sla_deadline": "..."}
 ```
 
-The worker picks it up, retrains only the affected shard, writes a signed
-manifest, and promotes a new `model_version`. `GET /v1/erasure/{id}/certificate`
-returns it; `verify/verifier_cli.py` accepts it with no access to any of the
-above. `POST /v1/predict` reflects the new `model_version` immediately after.
+```json
+{ "erasure_id": "1967c3c3-…", "status": "queued", "sla_deadline": "2026-09-20T10:23:56Z" }
+```
 
-Run everything against the pinned image instead:
+The worker retrains only the affected shard, writes a signed certificate, and
+promotes a new `model_version`. Then:
 
 ```bash
-docker compose run --rm determinism python -m pytest tests/unit -q
+.venv/bin/python -m verify.verifier_cli cert.json
 ```
 
-## Why determinism comes first
+```
+  ok  signature valid (Ed25519)
+  ok  absence proof valid against dataset_root 933d27c9b543f3f7… [sparse Merkle (smt-256)]
+  ok  subject 42818a91740bb31c… absent from shard 1 at model_version shard1-6e186637f7da
+VERIFIED
+```
 
-The product is a manifest saying a shard was retrained without a subject's
-data. Nothing about a weight tensor reveals whether that is true. The only
-affordable check is to re-run the rebuild and compare digests — which works
-only if a rebuild is a pure function of its inputs.
+</details>
 
-Seeding does not get you there. Float addition is not associative, and OpenMP
-splits reductions by thread count, so the same shard on a 4-core runner and a
-16-core one yields different normalisation constants and different weights.
-[ADR 0003](docs/adr/0003-cpu-only-determinism.md) has the measured numbers.
+---
 
-Determinism is scoped to a `code_digest`, not asserted across versions. A torch
-upgrade is allowed to change weights. It is not allowed to change them for a
-fixed image digest. Otherwise every dependency bump reads as a compliance
-incident.
+## What makes it hold up
 
-## What the manifest proves, and what it does not
+### Absence proofs that name nobody
 
-The Merkle absence proof shows a `subject_ref` is missing from the shard's
-retained record set. It does **not** bind `result_weights` to `dataset_root` —
-a pipeline could purge the record, publish a clean root, and ship the previous
-checkpoint. The signature would still verify, because a signature over a false
-claim is still a valid signature. The verifier prints this on every successful
-run rather than letting an auditor infer more than was shown.
+A sorted Merkle tree proves absence by handing over the target's two
+neighbours — so every certificate discloses two other subjects' identifiers,
+and an auditor collecting certificates slowly assembles a population census.
 
-Weight provenance rests on two things beyond the signature: `code_digest`, and
-sampling completed jobs for re-run. Sample selection is derived from
-`HMAC(erasure_id, audit_key)` rather than chosen by the worker, so an operator
-cannot steer the sample away from jobs it would rather not have re-run.
-**The re-run itself is not wired yet** — see Known gaps below.
+`verify/smt.py` uses a sparse Merkle tree instead. The `subject_ref` *is* the
+path through 2²⁵⁶ positions; absence means the leaf at your own position is
+empty. Siblings are subtree hashes — they commit to other subjects without
+naming them.
 
-## The proof leaks two neighbours
+| | sorted Merkle | sparse Merkle |
+|---|---|---|
+| Subject refs disclosed per proof | **2** | **0** |
+| Proof size (400-subject shard) | 2 leaves + paths | 6–9 siblings |
+| Verification | 0.2 ms | 0.23 ms |
 
-A sorted-Merkle non-inclusion proof works by naming the target's immediate
-neighbours in sort order, so every certificate discloses two other subjects'
-HMAC refs. They're pseudonymous, but an auditor collecting many certificates
-accumulates a growing slice of the shard's population. Inherent to the
-construction; a sparse Merkle tree avoids it at 256-level proof cost, and isn't
-built. [ADR 0002](docs/adr/0002-manifest-over-hash-equality.md) has the
-reasoning.
+Both numbers are asserted in `test_proof_names_no_other_subject`, not claimed
+here. → [ADR 0007](docs/adr/0007-sparse-merkle-and-serving-latency.md)
 
-## Known gaps, stated rather than hidden
+### Deterministic retraining
 
-Two things surfaced only by running the gateway and worker against a real
-Postgres instance, not by code review or unit tests, and are worth knowing
-about before this touches real data:
+An auditor verifies a rebuild by re-running it and comparing digests — which
+only works if a rebuild is a pure function of its inputs. Seeding does not get
+you there. Float addition is not associative and OpenMP splits reductions by
+thread count, so the same shard on 4 cores and 16 cores yields different
+weights.
 
-**The reproducibility spot-check selects a sample but doesn't re-run it yet.**
-`worker/jobs.py::_should_spot_check` picks jobs via `HMAC(erasure_id,
-audit_key)` and that part is real and tested. Actually re-running a sampled job
-and comparing digests needs the pre-purge shard state, which nothing currently
-snapshots. Writing a fabricated "matched" row without a real second rebuild
-would corrupt the one table Phase 7's drift alert depends on, so nothing is
-written instead of writing something false.
+Thread counts are pinned, `PYTHONHASHSEED` is enforced, the base image is
+digest-pinned, and every dependency is `==`. Determinism is scoped to a
+`code_digest` — a torch upgrade may change weights; it may not change them for
+a fixed image. → [ADR 0003](docs/adr/0003-cpu-only-determinism.md)
 
-**Offline mutation (shard purge, retrain, `routing.json`) is not transactional
-with Postgres.** If the worker's DB bookkeeping fails after a rebuild has
-already happened, the job needs manual reconciliation, not a blind retry — a
-retry would call into a routing table that no longer lists the subject and
-fail with a confusing error that hides the real, already-resolved problem. The
-worker fails loudly and immediately with an explicit message when this happens,
-rather than leaving the job silently stuck until its lease expires. See
-[ADR 0006](docs/adr/0006-content-addressed-checkpoints-and-claim-then-commit.md)
-for the full account, including a second defect (silently overwritten
-checkpoint files) found and fixed the same way.
+### Serving latency
 
-## Scope boundary
+Phase 5 assumed the serving cost was ensembling across shards and prescribed
+batching. Measurement disagreed:
 
-UnlearnShield erases a subject from the **model**. It does not erase them from
-your data lake, your feature store, or your backups. Those nodes of the
-deletion graph sit behind interfaces here and are owned by the upstream
-system. A compliance story that only covers the model is incomplete, and this
-is the part it covers.
+| Per `/v1/predict` | Before | After |
+|---|---:|---:|
+| Fresh `psycopg2.connect` | 6.22 ms | pooled |
+| Load 5 checkpoints from disk | 2.63 ms | cached |
+| **Ensemble forward passes** | **0.15 ms** | batched |
+| **p50 / p99** | **13.3 / 45.9 ms** | **3.5 / 9.8 ms** |
+
+The forward pass was 1.7% of the request. Optimising it — via ONNX, a Rust
+gateway, whatever — would have left 8.85 ms of connection setup and file I/O
+untouched. → [ADR 0007](docs/adr/0007-sparse-merkle-and-serving-latency.md)
+
+The ensemble cache is keyed on the promoted version's checkpoint hashes, so a
+rebuild changes the key and the stale entry becomes unreachable. That is a
+correctness decision: a hand-invalidated cache eventually misses one, and the
+failure mode is a model that keeps scoring with erased data in it while every
+job row says `done`.
+
+---
+
+## Architecture
+
+```
+                        ┌──────────────────────────────┐
+                        │  config/determinism.py       │
+                        │  everything downstream        │
+                        │  depends on this holding      │
+                        └───────────────┬──────────────┘
+                                        │
+        ┌───────────────────────────────┼───────────────────────────────┐
+        ▼                               ▼                               ▼
+┌───────────────┐            ┌────────────────────┐          ┌──────────────────┐
+│   engine/     │            │     gateway/       │          │     verify/      │
+│  offline, no  │            │  stateless HTTP    │          │  zero imports    │
+│  network      │            │  never trains      │          │  from engine/,   │
+│               │            │                    │          │  gateway/, or db │
+│  sharder      │            │  auth  idempotency │          │                  │
+│  slicer       │            │  routes/           │          │  smt   merkle    │
+│  preprocessing│            └─────────┬──────────┘          │  manifest  sign  │
+│  train        │                      │                     │  verifier_cli    │
+│  rebuild ─────┼──────────┐           ▼                     └────────▲─────────┘
+└───────────────┘          │  ┌─────────────────┐                     │
+                           │  │   Postgres      │                     │
+        ┌──────────────────┘  │  queue + audit  │      certificate ───┘
+        ▼                     └────────▲────────┘
+┌───────────────┐                      │
+│   worker/     │──────────────────────┘
+│  no ingress   │   claim-then-commit, lease + reaper
+│  never serves │   batches jobs per shard: one retrain, many erasures
+└───────────────┘
+```
+
+`verify/` is isolated on purpose, and a test enforces it by copying the
+directory somewhere bare and running it there. **A verifier that needs the
+training system to run is not a proof** — it is the operator asserting their
+own compliance and shipping a script that agrees.
+
+---
+
+## What the certificate proves — and what it doesn't
+
+**Proves.** The subject is absent from the record set whose root the
+certificate names, and the certificate was signed by the holder of the private
+key.
+
+**Does not prove.** That `result_weights` was trained on that record set.
+Nothing binds the two. An operator could purge the record, publish a clean
+root, and ship the previous checkpoint — the signature would still verify,
+because a signature over a false claim is a valid signature.
+
+That gap is closed by `code_digest` plus re-running a sample of completed
+rebuilds. Sample selection is `HMAC(erasure_id, audit_key)` rather than the
+worker's choice, so an operator cannot steer it away from jobs it would rather
+not have re-run.
+
+**The verifier prints this limitation on every successful run.** An auditor
+should not have to read the source to learn what they were not shown.
+
+---
+
+## Known gaps
+
+Stated rather than buried. Both surfaced from running the system, not from
+reading it.
+
+**The reproducibility spot-check selects but does not yet re-run.** Sample
+selection is real and tested; the second rebuild needs pre-purge shard state
+that nothing snapshots. Writing a fabricated `matched=true` row would corrupt
+the one table a drift alert depends on, so nothing is written instead of
+something false.
+
+**Offline mutation is not transactional with Postgres.** A DB failure after a
+successful rebuild needs manual reconciliation, not a retry — the retry would
+call into a routing table that no longer lists the subject and fail with an
+error that hides the real problem. The worker fails loudly and immediately and
+says so. → [ADR 0006](docs/adr/0006-content-addressed-checkpoints-and-claim-then-commit.md)
+
+**Scope.** UnlearnShield erases a subject from the **model**. Not from your
+data lake, feature store, or backups — those are upstream and owned elsewhere.
+A compliance story covering only the model is incomplete; this is the part it
+covers.
+
+---
+
+## Roadmap
+
+| Phase | Status | |
+|---|:---:|---|
+| 0 — Bootstrap | done | Repo, schema, digest-pinned image, CI |
+| 1 — Determinism | done | Thread pinning, hash-seed enforcement, spot-check harness |
+| 2 — Engine | done | Shard, slice, per-shard preprocessing, train, rebuild |
+| 3 — Verification | done | Sparse Merkle proofs, canonical manifests, Ed25519, standalone verifier |
+| 4 — Gateway & worker | done | FastAPI, Postgres queue with leases, idempotent intake |
+| 5 — Serving | done | Connection pooling, ensemble cache, batched inference |
+| 6 — Ops dashboard | next | Queue depth, SLA countdown, certificate viewer |
+| 7 — Hardening | | Spot-check re-run, load ceiling, incident runbooks |
+
+Evaluated and deliberately **not** built, with reasoning in
+[docs/roadmap-assessment.md](docs/roadmap-assessment.md): GBDT/XGBoost SISA
+(genuinely valuable, largest real item — deferred, not dismissed), ZK-SNARK
+proofs, graph/vector unlearning, dynamic re-sharding, Kafka and warehouse CDC
+connectors, ONNX and Rust inference.
+
+---
 
 ## Testing
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q          # no DB needed
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 125, no database
+
 docker compose up -d postgres
 DATABASE_URL=postgresql://unlearnshield:unlearnshield@localhost:55432/unlearnshield \
-  .venv/bin/python -m pytest tests/integration tests/e2e -q        # real Postgres
+  .venv/bin/python -m pytest tests/integration tests/e2e -q                  # 19, real Postgres
 ```
 
-Integration and e2e tests skip cleanly (not fail) when Postgres is
-unreachable, so `pytest tests/unit` stays fast and hermetic in any
-environment, and the fuller suite runs wherever a real Postgres exists.
+Integration and e2e tests **skip** rather than fail when Postgres is
+unreachable, so the unit suite stays fast and hermetic anywhere while the full
+suite runs wherever a database exists.
 
-## Licence
+| Suite | Guards |
+|---|---|
+| `test_determinism` | Thread pinning, hash-seed enforcement, digest reproducibility |
+| `test_smt` | Absence proofs, forged and dropped siblings, the zero-leak claim |
+| `test_merkle` | Legacy sorted-tree proofs — certificates outlive their issuing code |
+| `test_batched_ensemble` | Batched output equals sequential to 1e-6; cache keying |
+| `test_rebuild` | Purge, rollback, certificate emission, one-slice-per-subject invariant |
+| `test_preprocessing_isolation` | Per-shard constants; no cross-shard statistical leak |
+| `test_verifier_isolation` | `verify/` runs in a bare directory with no training system |
+| `test_worker_queue` | `SKIP LOCKED` claiming, lease expiry, reaper |
+| `test_e2e_erasure` | Enqueue → worker → certificate → verify → predict reflects it |
 
-MIT.
+---
+
+<div align="center">
+
+**[Implementation plan](docs/implementation-plan.md)** ·
+**[Plan corrections](docs/plan-corrections.md)** ·
+**[Decision records](docs/adr/)** ·
+**[Roadmap assessment](docs/roadmap-assessment.md)**
+
+MIT
+
+</div>

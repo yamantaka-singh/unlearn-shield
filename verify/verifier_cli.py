@@ -18,8 +18,21 @@ import sys
 
 from nacl.signing import VerifyKey
 
+from verify import merkle, smt
 from verify.manifest import REQUIRED_FIELDS, canonical_bytes
-from verify.merkle import verify_absence
+
+
+def verify_absence(subject_ref: str, proof: dict, dataset_root: str) -> tuple[bool, str]:
+    """Dispatch on the proof's declared scheme, and say which one ran.
+
+    A certificate outlives the code that issued it, so this keeps checking
+    sorted-Merkle proofs (verify/merkle.py) issued before the sparse tree
+    replaced it. New certificates are 'smt-256', which names no other subject
+    -- see verify/smt.py.
+    """
+    if isinstance(proof, dict) and proof.get("scheme") == "smt-256":
+        return smt.verify_absence(subject_ref, proof, dataset_root), "sparse Merkle (smt-256)"
+    return merkle.verify_absence(subject_ref, proof, dataset_root), "sorted Merkle (legacy)"
 
 
 def verify_certificate(manifest: dict, public_key: VerifyKey) -> tuple[bool, list[str]]:
@@ -43,10 +56,11 @@ def verify_certificate(manifest: dict, public_key: VerifyKey) -> tuple[bool, lis
     # Only meaningful after the signature checks out: before that, dataset_root
     # and absence_proof are attacker-controlled and proving them consistent
     # with each other proves nothing.
-    if verify_absence(manifest["subject_ref"], manifest["absence_proof"],
-                      manifest["dataset_root"]):
+    proof_ok, scheme = verify_absence(manifest["subject_ref"], manifest["absence_proof"],
+                                      manifest["dataset_root"])
+    if proof_ok:
         findings.append(f"absence proof valid against dataset_root "
-                        f"{manifest['dataset_root'][:16]}...")
+                        f"{manifest['dataset_root'][:16]}... [{scheme}]")
     else:
         return False, findings + ["ABSENCE PROOF INVALID -- subject is not provably "
                                   "absent from the retained set"]

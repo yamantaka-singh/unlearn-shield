@@ -5,6 +5,10 @@ import pytest
 from nacl.signing import SigningKey
 
 from verify.manifest import REQUIRED_FIELDS, build, canonical_bytes
+# Deliberately the OLD sorted-Merkle scheme. engine/rebuild.py now issues
+# sparse-tree proofs, so these cases double as the regression test that
+# certificates issued before that switch still verify -- a certificate outlives
+# the code that made it. test_smt_scheme_also_verifies covers the current one.
 from verify.merkle import build_root, prove_absence
 from verify.sign import verify_manifest
 from verify.verifier_cli import verify_certificate
@@ -112,3 +116,46 @@ def test_verify_manifest_helper_matches_the_cli(signed):
     sig = m.pop("signature")
     assert verify_manifest(m, sig, pub)
     assert not verify_manifest({**m, "shard": 99}, sig, pub)
+
+
+def test_smt_scheme_also_verifies():
+    """The scheme engine/rebuild.py actually issues today."""
+    from verify import smt
+
+    population = [sha256(f"s{i}".encode()).hexdigest() for i in range(64)]
+    target = sha256(b"erased").hexdigest()
+    key = SigningKey.generate()
+    m = build(
+        subject_ref=target, shard=2, resumed_from="slice3",
+        dataset_root=smt.build_root(population),
+        absence_proof=smt.prove_absence(target, population),
+        code_digest="sha256:img", config_digest="sha256:cfg",
+        result_weights="sha256:w", model_version="v47",
+        purged_at="2026-08-21T10:00:00Z", completed_at="2026-08-21T10:04:12Z",
+    )
+    m["signature"] = key.sign(canonical_bytes(m)).signature.hex()
+
+    ok, findings = verify_certificate(dict(m), key.verify_key)
+    assert ok, findings
+    assert any("smt-256" in f for f in findings)
+
+
+def test_smt_certificate_with_a_false_claim_is_rejected():
+    """Signed correctly, but claiming absence of a subject still in the set."""
+    from verify import smt
+
+    population = [sha256(f"s{i}".encode()).hexdigest() for i in range(64)]
+    key = SigningKey.generate()
+    decoy = sha256(b"decoy").hexdigest()
+    m = build(
+        subject_ref=population[10], shard=2, resumed_from="slice3",
+        dataset_root=smt.build_root(population),
+        absence_proof=smt.prove_absence(decoy, population),
+        code_digest="d", config_digest="c", result_weights="w", model_version="v",
+        purged_at="2026-08-21T10:00:00Z", completed_at="2026-08-21T10:04:12Z",
+    )
+    m["signature"] = key.sign(canonical_bytes(m)).signature.hex()
+
+    ok, findings = verify_certificate(m, key.verify_key)
+    assert not ok
+    assert any("ABSENCE PROOF INVALID" in f for f in findings)

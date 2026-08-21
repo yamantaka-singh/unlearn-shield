@@ -16,7 +16,7 @@ from hashlib import sha256
 from nacl.signing import SigningKey
 
 from verify.manifest import build, canonical_bytes
-from verify.merkle import build_root, prove_absence
+from verify.smt import build_root, prove_absence
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 FORBIDDEN = {"engine", "gateway", "worker", "config", "data", "scripts",

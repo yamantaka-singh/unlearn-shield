@@ -63,19 +63,30 @@ from `HMAC(erasure_id, audit_key)` so the operator cannot steer it. The verifier
 prints this limitation on every successful verification rather than leaving an
 auditor to infer more than was shown.
 
-## Known leak
+## Known leak — CLOSED by ADR 0007
 
-A sorted-Merkle non-inclusion proof necessarily reveals the target's two
-neighbours in sort order. Those neighbours are other subjects' HMAC refs. They
-are pseudonymous, but an auditor collecting many certificates accumulates a
-growing slice of the shard's population.
+*Original text, kept because the reasoning still explains why the sorted tree
+was replaced rather than patched:*
 
-This is inherent to the construction, not an implementation choice. A sparse
-Merkle tree over the full key space would prove the slot at `H(subject_ref)` is
-empty without revealing neighbours, at the cost of a 256-level (compressible)
-proof. Not built. The plan's open question about rate-limiting `erasure:attest`
-per subject_ref is the cheaper partial mitigation and should be answered before
-this serves a second tenant.
+> A sorted-Merkle non-inclusion proof necessarily reveals the target's two
+> neighbours in sort order. Those neighbours are other subjects' HMAC refs.
+> They are pseudonymous, but an auditor collecting many certificates
+> accumulates a growing slice of the shard's population.
+>
+> This is inherent to the construction, not an implementation choice. A sparse
+> Merkle tree over the full key space would prove the slot at
+> `H(subject_ref)` is empty without revealing neighbours, at the cost of a
+> 256-level (compressible) proof.
+
+That sparse tree is now built (`verify/smt.py`) and is what
+`engine/rebuild.py` issues. A certificate names no other subject:
+`tests/unit/test_smt.py::test_proof_names_no_other_subject` asserts the old
+scheme leaks exactly two refs and the new one leaks zero. See
+[ADR 0007](0007-sparse-merkle-and-serving-latency.md).
+
+`verify/merkle.py` stays, and the verifier still dispatches to it for proofs
+that declare no `scheme` — a certificate outlives the code that issued it, and
+a verifier that cannot check last year's certificate is broken.
 
 ## Rejected
 

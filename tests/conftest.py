@@ -31,12 +31,23 @@ def pg():
     `pytest tests/unit` stays fast and hermetic while these run wherever
     Postgres exists: locally with Docker, or in CI.
     """
-    from db.conn import connect
+    from db.conn import connect, reset_pool
+    from inference.batched_ensemble import clear_cache
     try:
         conn = connect()
     except Exception as exc:
         pytest.skip(f"Postgres unavailable: {exc}")
+    # The gateway's pool caches connections across cases; one holding a
+    # snapshot from before this TRUNCATE would serve stale rows.
+    reset_pool()
+    # Same hazard in the serving layer: the ensemble cache is keyed on
+    # checkpoint hashes, and successive tests build fresh corpora in fresh
+    # tmp_paths that can produce identical weights -- so a key can legitimately
+    # repeat while pointing at files that no longer exist.
+    clear_cache()
     with conn, conn.cursor() as cur:
         cur.execute(f"TRUNCATE {', '.join(TABLES)} RESTART IDENTITY CASCADE")
     yield conn
     conn.close()
+    reset_pool()
+    clear_cache()
