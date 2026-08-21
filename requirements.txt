@@ -1,0 +1,4 @@
+# Every version pinned with ==. Determinism (see docs/adr/0003) is a property of
+# the whole environment, not of the seed; a floated minor version silently breaks it.
+torch==2.5.1
+numpy==2.1.3

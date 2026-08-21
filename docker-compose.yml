@@ -1,0 +1,24 @@
+# Postgres plus the determinism check. Gateway and worker services land in
+# Phase 4 -- adding empty ones now would only give `docker compose up` a
+# crash loop to report.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: unlearnshield
+      POSTGRES_PASSWORD: unlearnshield
+      POSTGRES_DB: unlearnshield
+    ports: ["5432:5432"]
+    volumes:
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U unlearnshield"]
+      interval: 5s
+      retries: 10
+
+  determinism:
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://unlearnshield:unlearnshield@postgres:5432/unlearnshield
