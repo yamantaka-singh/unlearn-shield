@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: unlearnshield
       POSTGRES_PASSWORD: unlearnshield
       POSTGRES_DB: unlearnshield
-    ports: ["5432:5432"]
+    ports: ["55432:5432"]  # 5432 often taken by a native Postgres install
     volumes:
       - ./db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:

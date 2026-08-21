@@ -96,5 +96,10 @@ CREATE TABLE checkpoints (
     code_digest     TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE UNIQUE INDEX checkpoints_shard_slice_idx
-    ON checkpoints (shard, slice_idx, code_digest);
+-- No uniqueness constraint beyond the checkpoint_hash PK: every rebuild of a
+-- shard produces a NEW checkpoint for the same (shard, slice_idx, code_digest)
+-- -- that accumulation is correct, expected history, not a duplicate. A
+-- unique index on that triple (an earlier draft of this schema had one)
+-- breaks the second rebuild of any shard outright, since content-addressed
+-- hashes are the only uniqueness this table needs.
+CREATE INDEX checkpoints_shard_slice_idx ON checkpoints (shard, slice_idx);

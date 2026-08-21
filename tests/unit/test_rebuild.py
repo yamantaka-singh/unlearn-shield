@@ -133,3 +133,40 @@ def test_routing_entry_is_removed(built):
 def test_unknown_subject_is_refused(built):
     with pytest.raises(KeyError):
         rebuild_mod.rebuild("C9999999")
+
+
+def test_rebuild_emits_a_verifiable_certificate(built, monkeypatch):
+    """Closes the loop: the manifest the engine actually produces must verify
+    under the standalone verifier, not just a hand-built one from a fixture."""
+    from nacl.signing import SigningKey
+    from verify.verifier_cli import verify_certificate
+
+    key = SigningKey.generate()
+    monkeypatch.setenv("UNLEARNSHIELD_SIGNING_KEY", bytes(key).hex())
+
+    routing, _ = built
+    target = next(s for s in (f"C{i:07d}" for i in range(200)) if subject_ref(s) in routing)
+
+    manifest = rebuild_mod.rebuild(target)["manifest"]
+
+    ok, findings = verify_certificate(dict(manifest), key.verify_key)
+    assert ok, findings
+    assert manifest["subject_ref"] == subject_ref(target)
+
+
+def test_emitted_certificate_names_a_root_the_subject_is_really_gone_from(built, monkeypatch):
+    """Guards against a root computed before the purge -- which would verify
+    cleanly while proving absence from a set the model never trained on."""
+    from nacl.signing import SigningKey
+    from verify.merkle import build_root
+
+    monkeypatch.setenv("UNLEARNSHIELD_SIGNING_KEY", bytes(SigningKey.generate()).hex())
+    routing, _ = built
+    target = next(s for s in (f"C{i:07d}" for i in range(200)) if subject_ref(s) in routing)
+    shard = routing[subject_ref(target)]["shard"]
+
+    manifest = rebuild_mod.rebuild(target)["manifest"]
+
+    retained = set(train_mod.load_shard(shard)["subject_ref"].tolist())
+    assert subject_ref(target) not in retained
+    assert manifest["dataset_root"] == build_root(retained)

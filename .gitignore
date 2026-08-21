@@ -7,3 +7,4 @@ data/*.parquet
 data/shards/
 .env
 *.key
+.signing_key
