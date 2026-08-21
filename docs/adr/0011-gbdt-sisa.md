@@ -1,8 +1,8 @@
 # 0011 — SISA over gradient-boosted trees
 
-**Status:** offline engine accepted, 2026-08-21
-**Scope:** `engine/gbdt.py` only. Not wired into the gateway, worker, or
-manifest pipeline — see "What is not built".
+**Status:** accepted, 2026-08-21. Manifest integration added same day.
+**Scope:** `engine/gbdt.py`, offline. Not wired into the gateway or worker --
+see "What is not built".
 
 ## Context
 
@@ -86,14 +86,38 @@ the pin removed**, which is a test that looks like a guard and guards nothing.
 The reasoning is recorded in the test's own docstring so a future reader does
 not "strengthen" it back into something vacuous.
 
+## Manifest integration
+
+Added the same day, once the offline engine's core claims were verified.
+`engine/gbdt.py::rebuild_batch_by_ref` mirrors `engine/rebuild.py`'s function
+of the same name exactly: same routing table, same shard file format, same
+`verify/smt.py` proof and `verify/sign.py` signing. A GBDT erasure produces a
+certificate that passes through the **same standalone verifier**, unmodified
+-- `test_rebuild_emits_a_certificate_the_standalone_verifier_accepts` runs the
+real path end to end and checks it with `verify.verifier_cli.verify_certificate`.
+
+Deliberately independent rather than merged with the MLP path. The two engines
+are not designed to run against the same `routing.json` and shard directory at
+once -- each engine's rebuild pops routing rows the same way the MLP path does,
+so running both against one `data/shards/` would have either engine's rebuild
+erase the other's routing entry too. These are alternative, non-coexisting
+deployments (pick one engine per deployment), not a hybrid; making them coexist
+in one shard is a real design decision this ADR does not make.
+
+`config_digest()` binds `TREES_PER_SLICE`, `PARAMS`, and slice/shard counts --
+the same purpose as the MLP path's function of the same name, so a rebuild
+under different hyperparameters cannot be substituted for another.
+
 ## What is not built
 
-The gateway, worker, manifest, and SMT paths are untouched. This is the offline
-engine only, mirroring how Phase 2 staged the MLP path before Phase 4 wired it
-up. Serving needs its own decision: `inference/batched_ensemble.py` is
-PyTorch-specific (`stack_module_state` + `vmap`) and has no tree analogue, so a
-GBDT ensemble needs a different serving path rather than a parameter to the
-existing one.
+The gateway and worker are untouched -- no HTTP route, no queue integration,
+no dashboard entry. Serving needs its own decision:
+`inference/batched_ensemble.py` is PyTorch-specific (`stack_module_state` +
+`vmap`) and has no tree analogue, so a GBDT ensemble needs a different serving
+path rather than a parameter to the existing one. A production deployment also
+needs a schema decision the manifest path sidesteps: `model_versions` has no
+column distinguishing an MLP checkpoint hash from a GBDT booster hash, because
+nothing writes GBDT results there yet.
 
 LightGBM is not built. It is the same shape — `init_model=` for continuation,
 and the same truncation property — so the second implementation is mechanical

@@ -28,14 +28,21 @@ That last point has one sharp exception, which is the whole reason
 `base_score` is pinned below.
 """
 
+import json
 import os
+from datetime import datetime, timezone
+from hashlib import sha256
 
 import numpy as np
 import xgboost as xgb
 
 from config.determinism import enforce_determinism
-from config.settings import NUM_SLICES, SEED, SHARD_DIR
+from config.settings import CODE_DIGEST, NUM_SHARDS, NUM_SLICES, SEED, SHARD_DIR, subject_ref
 from data.synth import NUMERIC_COLUMNS, TYPES
+from engine.train import load_routing, load_shard, save_shard
+from verify import manifest as manifest_mod
+from verify.sign import sign_manifest
+from verify.smt import build_root, prove_absence
 
 TREES_PER_SLICE = int(os.environ.get("GBDT_TREES_PER_SLICE", "20"))
 
@@ -124,10 +131,15 @@ def rollback(booster: xgb.Booster, to_slice: int,
     return booster[0:to_slice * trees_per_slice]
 
 
-def rebuild(shard: int, refs: list, records: dict, min_slice: int,
-            booster: xgb.Booster,
-            trees_per_slice: int = TREES_PER_SLICE) -> tuple[xgb.Booster, dict]:
+def rebuild_booster(shard: int, refs: list, records: dict, min_slice: int,
+                    booster: xgb.Booster,
+                    trees_per_slice: int = TREES_PER_SLICE) -> tuple[xgb.Booster, dict]:
     """Purge `refs`, roll back to `min_slice`, boost forward on what remains.
+
+    Pure in-memory operation -- no file I/O, no manifest. `rebuild_batch_by_ref`
+    below is the entrypoint that adds those and is what a caller normally wants;
+    this is the piece it's built from, and what the unit tests exercise
+    directly since they construct their own in-memory shards.
 
     Returns (rebuilt booster, retained records). The purge happens here rather
     than in the caller so it cannot be forgotten, and the retained rows come
@@ -144,3 +156,155 @@ def rebuild(shard: int, refs: list, records: dict, min_slice: int,
 
 def predict(booster: xgb.Booster, records: dict, rows: np.ndarray) -> np.ndarray:
     return booster.predict(xgb.DMatrix(features(records, rows)))
+
+
+def save_booster(booster: xgb.Booster, shard: int) -> None:
+    os.makedirs(SHARD_DIR, exist_ok=True)
+    booster.save_model(booster_path(shard))
+
+
+def load_booster(shard: int) -> xgb.Booster:
+    booster = xgb.Booster()
+    booster.load_model(booster_path(shard))
+    return booster
+
+
+def config_digest() -> str:
+    """Same purpose as engine/rebuild.py's function of the same name: binds
+    the hyperparameters that shape the boosted trees into the manifest, so a
+    rebuild run under different settings cannot be substituted for another.
+    """
+    config = json.dumps({"num_shards": NUM_SHARDS, "num_slices": NUM_SLICES,
+                         "trees_per_slice": TREES_PER_SLICE, "seed": SEED,
+                         **{k: v for k, v in PARAMS.items() if k != "seed"}},
+                        sort_keys=True, separators=(",", ":"))
+    return "sha256:" + sha256(config.encode()).hexdigest()
+
+
+def build(routing: dict, trees_per_slice: int = TREES_PER_SLICE) -> None:
+    """Train and save an initial booster for every shard `routing` covers.
+
+    Reuses engine.train.build()'s routing and shard files -- the corpus is not
+    engine-specific, only which model trains on it. Run after
+    `engine.train.build()`, against the same data/shards/ directory:
+
+        routing = engine.train.build(n_subjects=...)
+        engine.gbdt.build(routing)
+    """
+    shards = {e["shard"] for e in routing.values()}
+    for shard in sorted(shards):
+        records = load_shard(shard)
+        save_booster(train_shard(shard, records, trees_per_slice=trees_per_slice), shard)
+
+
+def rebuild_batch_by_ref(refs: list, trees_per_slice: int = TREES_PER_SLICE,
+                         sign: bool = True) -> dict:
+    """The GBDT counterpart to engine/rebuild.py::rebuild_batch_by_ref. Same
+    routing table, same shard file format, same manifest and proof machinery
+    -- only the model differs.
+
+    Deliberately independent rather than merged into the MLP path. The two
+    engines are not designed to run against the same routing.json and shard
+    directory at once: this function pops routing rows exactly like the MLP
+    path does, so running both against one data/shards/ directory would have
+    each engine's rebuild erase the other's routing entry too. ADR 0011 treats
+    these as alternative, non-coexisting deployments, not a hybrid; making that
+    coexist is a real design decision this function does not make.
+    """
+    if not refs:
+        raise ValueError("rebuild_batch_by_ref called with no subjects")
+    purged_at = datetime.now(timezone.utc).isoformat()
+    routing = load_routing()
+
+    for ref in refs:
+        if ref not in routing:
+            raise KeyError(f"no routing entry for subject (ref {ref[:12]}...)")
+
+    entries = [routing[r] for r in refs]
+    shards = {e["shard"] for e in entries}
+    if len(shards) != 1:
+        raise ValueError(f"batch spans shards {shards}; must be pre-grouped by shard")
+    shard = shards.pop()
+    min_slice = min(e["min_slice_idx"] for e in entries)
+
+    records = load_shard(shard)
+    booster = load_booster(shard)
+    rebuilt, retained = rebuild_booster(shard, refs, records, min_slice, booster,
+                                       trees_per_slice=trees_per_slice)
+    save_shard(shard, retained)
+    save_booster(rebuilt, shard)
+
+    result_weights = sha256(rebuilt.save_raw(raw_format="json")).hexdigest()
+    resumed_from = f"slice{min_slice - 1}" if min_slice > 0 else "fresh_init"
+    completed_at = datetime.now(timezone.utc).isoformat()
+
+    # Built from the retained set AFTER the purge, same reasoning as the MLP
+    # path: the proof has to be about the data that actually trained the
+    # model, not the set as it stood when the request arrived.
+    retained_refs = set(retained["subject_ref"].tolist())
+    dataset_root = build_root(retained_refs)
+    cfg_digest = config_digest()
+
+    manifests = {}
+    for ref in refs:
+        m = manifest_mod.build(
+            subject_ref=ref, shard=shard, resumed_from=resumed_from,
+            dataset_root=dataset_root, absence_proof=prove_absence(ref, retained_refs),
+            code_digest=CODE_DIGEST, config_digest=cfg_digest,
+            result_weights=result_weights,
+            model_version=f"gbdt-shard{shard}-{result_weights[:12]}",
+            purged_at=purged_at, completed_at=completed_at,
+        )
+        if sign:
+            m["signature"] = sign_manifest(m)
+        manifests[ref] = m
+
+    for ref in refs:
+        routing.pop(ref)
+    with open(os.path.join(SHARD_DIR, "routing.json"), "w") as f:
+        json.dump(routing, f, sort_keys=True, indent=1)
+
+    return {
+        "shard": shard,
+        "resumed_from": resumed_from,
+        "rows_purged": len(records["subject_ref"]) - len(retained["subject_ref"]),
+        "result_weights": result_weights,
+        "manifests": manifests,
+    }
+
+
+def rebuild_batch(subject_ids: list, **kwargs) -> dict:
+    """Raw-subject-ID entrypoint -- hash each id, then delegate. Mirrors
+    engine/rebuild.py's function of the same name."""
+    return rebuild_batch_by_ref([subject_ref(s) for s in subject_ids], **kwargs)
+
+
+def rebuild(subject_id: str, **kwargs) -> dict:
+    ref = subject_ref(subject_id)
+    result = rebuild_batch([subject_id], **kwargs)
+    return {
+        "subject_ref": ref,
+        "shard": result["shard"],
+        "resumed_from": result["resumed_from"],
+        "rows_purged": result["rows_purged"],
+        "result_weights": result["result_weights"],
+        "manifest": result["manifests"][ref],
+    }
+
+
+def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--subject", required=True)
+    parser.add_argument("--manifest-out")
+    args = parser.parse_args()
+    result = rebuild(args.subject)
+    if args.manifest_out:
+        with open(args.manifest_out, "w") as f:
+            json.dump(result["manifest"], f, indent=1, sort_keys=True)
+    print(json.dumps({k: v for k, v in result.items() if k != "manifest"}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

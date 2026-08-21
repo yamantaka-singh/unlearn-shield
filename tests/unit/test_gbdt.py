@@ -66,7 +66,7 @@ def test_rebuild_equals_a_clean_retrain_on_retained_data():
     min_slice = int(slice_of_subject[target_idx])
 
     full = gbdt.train_shard(0, records)
-    rebuilt, retained = gbdt.rebuild(0, [target], records, min_slice, full)
+    rebuilt, retained = gbdt.rebuild_booster(0, [target], records, min_slice, full)
 
     from_scratch = gbdt.train_shard(0, retained)
 
@@ -81,7 +81,7 @@ def test_rebuild_from_slice_zero_also_matches_a_clean_retrain():
     target = subjects[target_idx]
 
     full = gbdt.train_shard(0, records)
-    rebuilt, retained = gbdt.rebuild(0, [target], records, 0, full)
+    rebuilt, retained = gbdt.rebuild_booster(0, [target], records, 0, full)
 
     assert digest(rebuilt) == digest(gbdt.train_shard(0, retained))
 
@@ -141,7 +141,7 @@ def test_purged_subject_is_absent_from_the_retained_rows():
     target = subjects[int(np.flatnonzero(slice_of_subject > 0)[0])]
     assert (records["subject_ref"] == target).sum() > 0
 
-    _, retained = gbdt.rebuild(0, [target], records,
+    _, retained = gbdt.rebuild_booster(0, [target], records,
                                int(slice_of_subject[np.flatnonzero(subjects == target)[0]]),
                                gbdt.train_shard(0, records))
 
@@ -151,7 +151,7 @@ def test_purged_subject_is_absent_from_the_retained_rows():
 def test_purging_an_absent_subject_is_refused():
     records, _, _ = corpus()
     with pytest.raises(ValueError, match="none of"):
-        gbdt.rebuild(0, ["not-a-real-subject"], records, 1, gbdt.train_shard(0, records))
+        gbdt.rebuild_booster(0, ["not-a-real-subject"], records, 1, gbdt.train_shard(0, records))
 
 
 def test_resuming_without_a_booster_is_refused():
@@ -174,3 +174,95 @@ def test_features_of_one_row_do_not_depend_on_any_other_row():
 
     rows = np.arange(10)
     np.testing.assert_array_equal(gbdt.features(a, rows), gbdt.features(b, rows))
+
+
+# --------------------------------------------------------------------------
+# rebuild_batch_by_ref: the manifest-emitting entrypoint, against real files.
+# Mirrors tests/unit/test_rebuild.py's `built` fixture pattern.
+# --------------------------------------------------------------------------
+
+from engine import train as train_mod
+
+
+@pytest.fixture
+def gbdt_corpus(tmp_path, monkeypatch):
+    shard_dir = str(tmp_path / "shards")
+    monkeypatch.setattr(train_mod, "SHARD_DIR", shard_dir)
+    monkeypatch.setattr(gbdt, "SHARD_DIR", shard_dir)
+    routing = train_mod.build(n_subjects=150, seed=41)
+    gbdt.build(routing)
+    return routing
+
+
+def _target_id(routing, n_subjects=150):
+    from config.settings import subject_ref
+    return next(s for s in (f"C{i:07d}" for i in range(n_subjects)) if subject_ref(s) in routing)
+
+
+def test_rebuild_emits_a_certificate_the_standalone_verifier_accepts(gbdt_corpus, monkeypatch):
+    from nacl.signing import SigningKey
+    from verify.verifier_cli import verify_certificate
+
+    key = SigningKey.generate()
+    monkeypatch.setenv("UNLEARNSHIELD_SIGNING_KEY", bytes(key).hex())
+
+    target = _target_id(gbdt_corpus)
+    result = gbdt.rebuild(target)
+
+    # key.verify_key directly -- not a monkeypatched load_public_key -- since
+    # a name imported before a monkeypatch stays bound to the original
+    # function object; the patch only changes what a FRESH lookup of the
+    # module attribute sees.
+    ok, findings = verify_certificate(dict(result["manifest"]), key.verify_key)
+    assert ok, findings
+    assert "gbdt-shard" in result["manifest"]["model_version"]
+
+
+def test_rebuild_purges_the_subject_from_the_shard_file(gbdt_corpus, monkeypatch):
+    from nacl.signing import SigningKey
+    monkeypatch.setenv("UNLEARNSHIELD_SIGNING_KEY", bytes(SigningKey.generate()).hex())
+
+    target = _target_id(gbdt_corpus)
+    from config.settings import subject_ref
+    ref = subject_ref(target)
+    shard = gbdt_corpus[ref]["shard"]
+
+    before = train_mod.load_shard(shard)
+    assert (before["subject_ref"] == ref).sum() > 0
+
+    gbdt.rebuild(target)
+
+    after = train_mod.load_shard(shard)
+    assert (after["subject_ref"] == ref).sum() == 0
+
+
+def test_rebuild_removes_the_routing_entry(gbdt_corpus, monkeypatch):
+    from nacl.signing import SigningKey
+    monkeypatch.setenv("UNLEARNSHIELD_SIGNING_KEY", bytes(SigningKey.generate()).hex())
+
+    target = _target_id(gbdt_corpus)
+    from config.settings import subject_ref
+    ref = subject_ref(target)
+
+    gbdt.rebuild(target)
+
+    assert ref not in train_mod.load_routing()
+
+
+def test_repeated_erasure_of_the_same_subject_is_refused(gbdt_corpus, monkeypatch):
+    """Not idempotent by itself -- Phase 4's Idempotency-Key is what makes a
+    repeat HTTP request safe. Calling this twice directly must fail loudly,
+    not silently succeed against a subject who is already gone."""
+    from nacl.signing import SigningKey
+    monkeypatch.setenv("UNLEARNSHIELD_SIGNING_KEY", bytes(SigningKey.generate()).hex())
+
+    target = _target_id(gbdt_corpus)
+    gbdt.rebuild(target)
+    with pytest.raises(KeyError):
+        gbdt.rebuild(target)
+
+
+def test_config_digest_changes_when_trees_per_slice_changes(monkeypatch):
+    before = gbdt.config_digest()
+    monkeypatch.setattr(gbdt, "TREES_PER_SLICE", gbdt.TREES_PER_SLICE + 1)
+    assert gbdt.config_digest() != before

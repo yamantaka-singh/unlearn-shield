@@ -8,7 +8,7 @@ Remove a subject from a trained model and get back a signed certificate
 an auditor can verify — without access to your training system, your
 database, or your weights.
 
-[![tests](https://img.shields.io/badge/tests-208_passing-2ea043?style=flat-square)](#testing)
+[![tests](https://img.shields.io/badge/tests-213_passing-2ea043?style=flat-square)](#testing)
 [![p99](https://img.shields.io/badge/predict_p99-9.8ms-2ea043?style=flat-square)](#serving-latency)
 [![proof leak](https://img.shields.io/badge/subjects_leaked_per_proof-0-2ea043?style=flat-square)](#absence-proofs-that-name-nobody)
 [![python](https://img.shields.io/badge/python-3.11-3776ab?style=flat-square)](https://www.python.org)
@@ -63,7 +63,7 @@ spread is the entire point.
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements-dev.txt
 
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 165 tests, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 170 tests, no database
 ```
 
 `PYTHONHASHSEED` must be set before the interpreter starts, so the determinism
@@ -165,7 +165,14 @@ data** — not "behaves similarly", which is what gradient-ascent unlearning
 offers. Measured cost by the target's slice: 20% of a full build at slice 4,
 72% at slice 0. One booster file per shard instead of five checkpoints plus a
 preprocessor, and no fitted per-shard statistic at all, since trees are
-invariant to feature scaling. → [ADR 0011](docs/adr/0011-gbdt-sisa.md)
+invariant to feature scaling.
+
+`engine.gbdt.rebuild_batch_by_ref` mirrors the MLP path's manifest emission
+exactly — same routing table, same `verify/smt.py` proof, same signing — so a
+GBDT erasure produces a certificate the same standalone verifier accepts,
+unmodified. The gateway and worker are not wired to it yet; it's a second
+offline engine today, the same stage the MLP path was at after Phase 2.
+→ [ADR 0011](docs/adr/0011-gbdt-sisa.md)
 
 ### Deterministic retraining
 
@@ -346,7 +353,7 @@ connectors, ONNX and Rust inference.
 ## Testing
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 165, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 170, no database
 
 docker compose up -d postgres
 DATABASE_URL=postgresql://unlearnshield:unlearnshield@localhost:55432/unlearnshield \
@@ -371,7 +378,7 @@ suite runs wherever a database exists.
 | `test_eval_set` | Hand-rolled AUC vs. brute-force pairwise count, degenerate classes |
 | `test_eval_results` | A promotion's AUC matches an independent recomputation |
 | `test_dashboard` | Runs the real Streamlit app via `AppTest`; live certificate re-verification |
-| `test_gbdt` | Truncation is exact; rebuild is byte-identical to a clean retrain |
+| `test_gbdt` | Truncation is exact; rebuild is byte-identical to a clean retrain; real certificate verifies |
 | `test_spot_check` | Re-runs a real rebuild; detects a forced divergence; leaves checkpoints untouched |
 | `test_idempotency` | Replay dedupe, and that one principal's key never returns another's job |
 | `test_disagreement` | Optional review queue; schema guard against storing unerasable features |
