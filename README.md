@@ -8,7 +8,7 @@ Remove a subject from a trained model and get back a signed certificate
 an auditor can verify — without access to your training system, your
 database, or your weights.
 
-[![tests](https://img.shields.io/badge/tests-180_passing-2ea043?style=flat-square)](#testing)
+[![tests](https://img.shields.io/badge/tests-190_passing-2ea043?style=flat-square)](#testing)
 [![p99](https://img.shields.io/badge/predict_p99-9.8ms-2ea043?style=flat-square)](#serving-latency)
 [![proof leak](https://img.shields.io/badge/subjects_leaked_per_proof-0-2ea043?style=flat-square)](#absence-proofs-that-name-nobody)
 [![python](https://img.shields.io/badge/python-3.11-3776ab?style=flat-square)](https://www.python.org)
@@ -63,7 +63,7 @@ spread is the entire point.
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements-dev.txt
 
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 152 tests, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 154 tests, no database
 ```
 
 `PYTHONHASHSEED` must be set before the interpreter starts, so the determinism
@@ -305,6 +305,14 @@ covers.
 | 6 — Ops dashboard | done | Queue depth, live-reverifying certificate viewer, honest accuracy chart |
 | 7 — Hardening | next | Spot-check re-run, load ceiling, incident runbooks |
 
+**Optional, off by default:** a shard-disagreement review queue
+(`DISAGREEMENT_THRESHOLD`). Spread across shards scores AUC 0.574 as a fraud
+detector against the served mean's 0.515 — a real signal, so it is built, but
+kept out of the core: nothing in the erasure guarantee touches it, and it
+stores per-shard scores rather than transaction features, because a row with
+no `subject_id` could never be reached by an erasure.
+→ [ADR 0009](docs/adr/0009-shard-disagreement-review-queue.md)
+
 Evaluated and deliberately **not** built, with reasoning in
 [docs/roadmap-assessment.md](docs/roadmap-assessment.md): GBDT/XGBoost SISA
 (genuinely valuable, largest real item — deferred, not dismissed), ZK-SNARK
@@ -316,11 +324,11 @@ connectors, ONNX and Rust inference.
 ## Testing
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 152, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 154, no database
 
 docker compose up -d postgres
 DATABASE_URL=postgresql://unlearnshield:unlearnshield@localhost:55432/unlearnshield \
-  .venv/bin/python -m pytest tests/integration tests/e2e -q                  # 28, real Postgres
+  .venv/bin/python -m pytest tests/integration tests/e2e -q                  # 36, real Postgres
 ```
 
 Integration and e2e tests **skip** rather than fail when Postgres is

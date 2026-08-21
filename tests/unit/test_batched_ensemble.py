@@ -117,3 +117,26 @@ def test_different_checkpoints_are_a_different_cache_entry(tmp_path):
         paths.append((shard_paths, preproc_paths))
 
     assert load_ensemble(*paths[0]) is not load_ensemble(*paths[1])
+
+
+def test_predict_proba_is_exactly_the_mean_of_shard_probabilities():
+    """ADR 0009 refactored predict_proba to delegate to shard_probabilities so
+    the optional disagreement check could reuse the same forward pass. That
+    refactor must not have changed a single served score -- this is the
+    regression guard on "purely additive"."""
+    models, preprocessors, records = _shard_parts(seed=21)
+    rows = np.arange(24)
+    ensemble = ShardEnsemble(models, preprocessors)
+
+    per_shard = ensemble.shard_probabilities(records, rows)
+    assert per_shard.shape == (len(models), len(rows))
+    np.testing.assert_array_equal(ensemble.predict_proba(records, rows),
+                                  per_shard.mean(axis=0))
+
+
+def test_shard_probabilities_are_per_shard_not_broadcast():
+    """If this returned the same row repeated, spread would be identically
+    zero and the disagreement feature would silently never fire."""
+    models, preprocessors, records = _shard_parts(seed=23)
+    per_shard = ShardEnsemble(models, preprocessors).shard_probabilities(records, np.arange(8))
+    assert per_shard.std(axis=0).sum() > 0

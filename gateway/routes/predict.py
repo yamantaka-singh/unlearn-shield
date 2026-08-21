@@ -16,11 +16,12 @@ project exists to prevent.
 """
 
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
-from config.settings import CHECKPOINT_DIR
+from config.settings import CHECKPOINT_DIR, DISAGREEMENT_THRESHOLD
 from data.synth import TYPES
 from db.conn import pooled
+from gateway import disagreement
 from gateway.auth import require_scope
 from gateway.schemas import PredictRequest, PredictResponse
 from inference.batched_ensemble import load_ensemble
@@ -52,7 +53,8 @@ def _current_model(cur) -> tuple[str, dict]:
 
 
 @router.post("/predict", response_model=PredictResponse)
-def predict(body: PredictRequest, principal: str = Depends(require_scope("predict:invoke"))):
+def predict(body: PredictRequest, background: BackgroundTasks,
+            principal: str = Depends(require_scope("predict:invoke"))):
     with pooled() as conn:
         with conn.cursor() as cur:
             model_version, shard_paths = _current_model(cur)
@@ -69,6 +71,20 @@ def predict(body: PredictRequest, principal: str = Depends(require_scope("predic
         "newbalanceDest": np.array([body.newbalanceDest]),
         "type_idx": np.array([TYPES.index(body.type)]),
     }
-    probability = ensemble.predict_proba(record, np.array([0]))[0]
+    # Per-shard scores rather than predict_proba: same single forward pass,
+    # and the mean below is exactly what predict_proba would have returned.
+    # Taking them here is what lets the optional disagreement check cost one
+    # np.std over n_shards floats instead of a second inference.
+    shard_scores = ensemble.shard_probabilities(record, np.array([0]))[:, 0]
+    probability = float(shard_scores.mean())
 
-    return PredictResponse(fraud_probability=float(probability), model_version=model_version)
+    if disagreement.is_enabled():
+        spread = disagreement.spread(shard_scores)
+        if spread > DISAGREEMENT_THRESHOLD:
+            # BackgroundTasks runs after the response is sent, so the insert
+            # is off the hot path entirely -- the caller is never waiting on
+            # the review queue.
+            background.add_task(disagreement.record, model_version,
+                                shard_scores, probability, spread)
+
+    return PredictResponse(fraud_probability=probability, model_version=model_version)

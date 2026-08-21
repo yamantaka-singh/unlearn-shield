@@ -58,8 +58,14 @@ class ShardEnsemble:
         # storage; functional_call supplies the real tensors per call.
         self._base = copy.deepcopy(models[0]).to("meta")
 
-    def predict_proba(self, records: dict, rows: np.ndarray) -> np.ndarray:
-        """Mean fraud probability across shards, one row per entry in `rows`."""
+    def shard_probabilities(self, records: dict, rows: np.ndarray) -> np.ndarray:
+        """Per-shard probability, shape [n_shards, n_rows].
+
+        The mean of this is what gets served; the spread across it is the
+        optional disagreement signal (ADR 0009). Both callers share one
+        forward pass -- the per-shard scores already exist inside
+        predict_proba, which previously averaged them away.
+        """
         stacked = torch.stack([
             torch.from_numpy(p.transform(records, rows)) for p in self.preprocessors
         ])  # [n_shards, n_rows, n_features]
@@ -69,7 +75,11 @@ class ShardEnsemble:
 
         with torch.no_grad():
             logits = torch.vmap(one_shard)(self.params, self.buffers, stacked)
-        return torch.sigmoid(logits).mean(dim=0).squeeze(-1).numpy()
+        return torch.sigmoid(logits).squeeze(-1).numpy()
+
+    def predict_proba(self, records: dict, rows: np.ndarray) -> np.ndarray:
+        """Mean fraud probability across shards, one row per entry in `rows`."""
+        return self.shard_probabilities(records, rows).mean(axis=0)
 
 
 def load_ensemble(shard_paths: dict, preproc_paths: dict) -> ShardEnsemble:

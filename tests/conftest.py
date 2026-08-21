@@ -17,7 +17,14 @@ def _signing_key():
     os.environ.setdefault("UNLEARNSHIELD_SIGNING_KEY", bytes(SigningKey.generate()).hex())
 
 
+# Every table, so a case never inherits another's rows. eval_results was
+# already being cleared by CASCADE through its model_versions foreign key;
+# disagreement_reviews has no FK, so it genuinely leaked rows between tests
+# until listed here. Listing both explicitly rather than relying on which
+# ones happen to have a cascading parent: add a table to db/schema.sql, add
+# it here in the same commit.
 TABLES = ("reproducibility_checks", "erasure_manifests", "erasure_jobs",
+         "eval_results", "disagreement_reviews",
          "checkpoints", "model_versions", "subject_shard_map")
 
 

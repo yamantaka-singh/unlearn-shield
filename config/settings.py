@@ -71,6 +71,18 @@ DASHBOARD_GATEWAY_URL = os.environ.get("DASHBOARD_GATEWAY_URL", "http://localhos
 DASHBOARD_GATEWAY_TOKEN = os.environ.get("DASHBOARD_GATEWAY_TOKEN", "dev-token")
 
 
+# OPTIONAL: shard-disagreement review queue. 0.0 disables it entirely, which
+# is the default -- this is an experiment bolted alongside the serving path,
+# not part of the erasure guarantee, and nothing in the core flow depends on
+# it. Set to a population-std threshold (spread runs ~0.08 mean, ~0.14 p99 on
+# this repo's eval corpus) to start flagging.
+#
+# Calibrate against your own traffic rather than copying a number: spread
+# depends on shard count, on how non-identical the shards' data is, and shifts
+# slightly after each rebuild. Start at your observed p99 and tune from there.
+DISAGREEMENT_THRESHOLD = float(os.environ.get("DISAGREEMENT_THRESHOLD", "0.0"))
+
+
 # token -> {"principal": str, "scopes": {"predict:invoke", ...}}. A static
 # service-to-service map, not a user-account system: erasure:write callers are
 # a consent manager or an internal job runner, not end users hitting this API
