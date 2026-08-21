@@ -8,7 +8,7 @@ Remove a subject from a trained model and get back a signed certificate
 an auditor can verify — without access to your training system, your
 database, or your weights.
 
-[![tests](https://img.shields.io/badge/tests-144_passing-2ea043?style=flat-square)](#testing)
+[![tests](https://img.shields.io/badge/tests-180_passing-2ea043?style=flat-square)](#testing)
 [![p99](https://img.shields.io/badge/predict_p99-9.8ms-2ea043?style=flat-square)](#serving-latency)
 [![proof leak](https://img.shields.io/badge/subjects_leaked_per_proof-0-2ea043?style=flat-square)](#absence-proofs-that-name-nobody)
 [![python](https://img.shields.io/badge/python-3.11-3776ab?style=flat-square)](https://www.python.org)
@@ -63,7 +63,7 @@ spread is the entire point.
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements-dev.txt
 
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 125 tests, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 152 tests, no database
 ```
 
 `PYTHONHASHSEED` must be set before the interpreter starts, so the determinism
@@ -175,6 +175,39 @@ job row says `done`.
 
 ---
 
+## Ops dashboard
+
+`streamlit run dashboard/app.py` — queue depth per shard, an SLA countdown
+table, a certificate viewer that **re-verifies live** (not a cached pass/fail),
+an accuracy chart, and a "force rebuild now" button.
+
+That button is a `POST /v1/erasure` through stdlib `urllib`, exactly like any
+other caller — the dashboard has no other write path, and the database
+enforces it: it connects through `unlearnshield_readonly`, a role granted
+`SELECT` only. Verified directly, not assumed — an `INSERT` through that role
+raises `psycopg2.errors.InsufficientPrivilege`.
+
+The accuracy chart is a real AUC, not a plausible one. `worker/jobs.py`
+scores every promotion against a frozen, synthetic, non-subject eval corpus
+(`data/eval_set.py`) using the exact ensemble code that serves real traffic —
+two real promotions in testing produced `0.5151` and `0.5158`, not `1.0`, not
+round numbers chosen to look finished. → [ADR 0008](docs/adr/0008-dashboard-readonly-role-and-honest-eval.md)
+
+Building it caught three real bugs by actually running the thing rather than
+reading the code: a `uuid.UUID`/`str` key mismatch that crashed the
+certificate selector, light-pink row highlights with no explicit text color
+(nearly invisible under Streamlit's dark theme), and a deadlock where the
+dashboard's cached connection held an open transaction indefinitely, blocking
+a later database operation — fixed at the root (`autocommit=True` on a
+connection that only ever reads) rather than papered over.
+
+```bash
+export UNLEARNSHIELD_SIGNING_KEY=$(cat .signing_key)   # required for every compose command,
+docker compose up -d                                    # not just this one -- compose validates
+```                                                       # the whole file on each invocation
+
+---
+
 ## Architecture
 
 ```
@@ -269,8 +302,8 @@ covers.
 | 3 — Verification | done | Sparse Merkle proofs, canonical manifests, Ed25519, standalone verifier |
 | 4 — Gateway & worker | done | FastAPI, Postgres queue with leases, idempotent intake |
 | 5 — Serving | done | Connection pooling, ensemble cache, batched inference |
-| 6 — Ops dashboard | next | Queue depth, SLA countdown, certificate viewer |
-| 7 — Hardening | | Spot-check re-run, load ceiling, incident runbooks |
+| 6 — Ops dashboard | done | Queue depth, live-reverifying certificate viewer, honest accuracy chart |
+| 7 — Hardening | next | Spot-check re-run, load ceiling, incident runbooks |
 
 Evaluated and deliberately **not** built, with reasoning in
 [docs/roadmap-assessment.md](docs/roadmap-assessment.md): GBDT/XGBoost SISA
@@ -283,11 +316,11 @@ connectors, ONNX and Rust inference.
 ## Testing
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 125, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 152, no database
 
 docker compose up -d postgres
 DATABASE_URL=postgresql://unlearnshield:unlearnshield@localhost:55432/unlearnshield \
-  .venv/bin/python -m pytest tests/integration tests/e2e -q                  # 19, real Postgres
+  .venv/bin/python -m pytest tests/integration tests/e2e -q                  # 28, real Postgres
 ```
 
 Integration and e2e tests **skip** rather than fail when Postgres is
@@ -305,6 +338,9 @@ suite runs wherever a database exists.
 | `test_verifier_isolation` | `verify/` runs in a bare directory with no training system |
 | `test_worker_queue` | `SKIP LOCKED` claiming, lease expiry, reaper |
 | `test_e2e_erasure` | Enqueue → worker → certificate → verify → predict reflects it |
+| `test_eval_set` | Hand-rolled AUC vs. brute-force pairwise count, degenerate classes |
+| `test_eval_results` | A promotion's AUC matches an independent recomputation |
+| `test_dashboard` | Runs the real Streamlit app via `AppTest`; live certificate re-verification |
 
 ---
 

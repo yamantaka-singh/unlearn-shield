@@ -20,7 +20,7 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 
-from config.settings import DATABASE_URL
+from config.settings import DASHBOARD_DATABASE_URL, DATABASE_URL
 
 _pool = None
 _pool_lock = threading.Lock()
@@ -28,6 +28,29 @@ _pool_lock = threading.Lock()
 
 def connect():
     conn = psycopg2.connect(DATABASE_URL)
+    psycopg2.extras.register_uuid()
+    return conn
+
+
+def connect_readonly():
+    """The dashboard's connection, bound to the DB role that cannot write
+    (db/schema.sql). A role that cannot write enforces "the dashboard never
+    writes to the DB directly" at the database, not only in application code
+    a future edit could bypass.
+
+    autocommit=True, deliberately: a plain psycopg2 connection implicitly
+    opens a transaction on the first query and leaves it open until an
+    explicit commit. The dashboard holds one connection for its whole
+    lifetime, so a read-only session with no commit call would hold a
+    snapshot -- and its locks -- open indefinitely. Caught by a real deadlock
+    in tests/e2e/test_dashboard.py: a stale open transaction on this
+    connection blocked a later test's TRUNCATE, which never released the
+    connection was waiting to reuse. Autocommit means each SELECT starts and
+    ends its own transaction, which is also just the correct mode for a
+    connection that only ever reads.
+    """
+    conn = psycopg2.connect(DASHBOARD_DATABASE_URL)
+    conn.autocommit = True
     psycopg2.extras.register_uuid()
     return conn
 

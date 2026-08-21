@@ -54,6 +54,23 @@ POLL_BATCH_SIZE = int(os.environ.get("POLL_BATCH_SIZE", "20"))
 AUDIT_KEY = os.environ.get("AUDIT_KEY", "dev-only-not-a-secret").encode()
 SPOT_CHECK_RATE = float(os.environ.get("SPOT_CHECK_RATE", "0.01"))
 
+# Phase 6
+# The dashboard reads its own connection, bound to the read-only role
+# (db/schema.sql) rather than the gateway's writable one -- a role that
+# cannot write enforces "the dashboard never writes to the DB directly" at
+# the database, not only in application code a future edit could bypass.
+DASHBOARD_DATABASE_URL = os.environ.get(
+    "DASHBOARD_DATABASE_URL",
+    "postgresql://unlearnshield_readonly:unlearnshield_readonly@localhost:55432/unlearnshield")
+
+# The dashboard's one write path -- "force rebuild now" -- goes through this
+# HTTP endpoint exactly as any other caller would, rather than inserting into
+# erasure_jobs itself. GATEWAY_TOKEN needs erasure:write; the dev default
+# matches auth_tokens()'s own default below.
+DASHBOARD_GATEWAY_URL = os.environ.get("DASHBOARD_GATEWAY_URL", "http://localhost:8000")
+DASHBOARD_GATEWAY_TOKEN = os.environ.get("DASHBOARD_GATEWAY_TOKEN", "dev-token")
+
+
 # token -> {"principal": str, "scopes": {"predict:invoke", ...}}. A static
 # service-to-service map, not a user-account system: erasure:write callers are
 # a consent manager or an internal job runner, not end users hitting this API

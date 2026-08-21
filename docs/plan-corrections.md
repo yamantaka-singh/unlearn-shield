@@ -127,3 +127,9 @@ the full-shard-retrain case rather than the average.
 `docker compose up` cannot bring up gateway and worker at Phase 0 because
 neither exists; stub services would only supply a crash loop. `docker-compose.yml`
 runs Postgres and the determinism check, and grows the other two in Phase 4.
+
+Correction: this note said Phase 4 would add them; Phase 4's commit built the
+code but left `docker-compose.yml` unchanged, so `docker compose up` still
+couldn't bring up the gateway or worker for two more phases. Fixed in Phase 6,
+alongside the dashboard service, since fixing an ops dashboard's own compose
+file was the natural moment to close out the debt rather than defer it again.

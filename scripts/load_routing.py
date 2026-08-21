@@ -17,6 +17,7 @@ from psycopg2.extras import Json, execute_values
 from config.settings import CHECKPOINT_DIR, CODE_DIGEST, NUM_SHARDS, NUM_SLICES
 from db.conn import connect
 from engine.train import checkpoint_path, load_routing
+from worker.jobs import record_eval
 
 
 def _file_hash(path: str) -> str:
@@ -68,8 +69,10 @@ def main() -> int:
                 VALUES (%s, %s, %s)
                 ON CONFLICT (model_version) DO NOTHING
             """, ("v0-baseline", Json(shard_checkpoints), "v0"))
+            baseline_auc = record_eval(cur, "v0-baseline", shard_checkpoints)
 
-        print(f"loaded {len(routing)} subjects, baseline model_version v0-baseline")
+        print(f"loaded {len(routing)} subjects, baseline model_version v0-baseline, "
+              f"eval AUC {baseline_auc:.4f}")
     finally:
         conn.close()
     return 0

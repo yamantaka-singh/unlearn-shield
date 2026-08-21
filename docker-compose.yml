@@ -1,6 +1,12 @@
-# Postgres plus the determinism check. Gateway and worker services land in
-# Phase 4 -- adding empty ones now would only give `docker compose up` a
-# crash loop to report.
+# Postgres, gateway, worker, dashboard, and the determinism check.
+#
+# Gateway and worker share one image (this Dockerfile) with different
+# commands, per the original plan's repo layout -- they're the same code, just
+# never running each other's routes. Both mount ./data/shards and
+# ./checkpoints so the worker's writes (retrained shards, content-addressed
+# checkpoints, routing.json) are visible to the gateway's reads without a
+# shared object store, which the plan explicitly stubs behind an interface
+# rather than builds (see Assumption 3).
 services:
   postgres:
     image: postgres:16-alpine
@@ -22,3 +28,46 @@ services:
       postgres: {condition: service_healthy}
     environment:
       DATABASE_URL: postgresql://unlearnshield:unlearnshield@postgres:5432/unlearnshield
+
+  gateway:
+    build: .
+    command: ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://unlearnshield:unlearnshield@postgres:5432/unlearnshield
+      # No default: a signing key baked into the image is a signing key
+      # checked into git history the day someone forgets it's there. Set from
+      # `.signing_key` in dev, a secrets manager in production.
+      UNLEARNSHIELD_SIGNING_KEY: ${UNLEARNSHIELD_SIGNING_KEY:?set from .signing_key or a secrets manager}
+    ports: ["8000:8000"]
+    volumes:
+      - ./data/shards:/app/data/shards
+      - ./checkpoints:/app/checkpoints
+
+  worker:
+    build: .
+    command: ["python", "-m", "worker.main"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql://unlearnshield:unlearnshield@postgres:5432/unlearnshield
+      UNLEARNSHIELD_SIGNING_KEY: ${UNLEARNSHIELD_SIGNING_KEY:?set from .signing_key or a secrets manager}
+    volumes:
+      - ./data/shards:/app/data/shards
+      - ./checkpoints:/app/checkpoints
+    # No ports: this service has no ingress, by design -- see worker/main.py.
+
+  dashboard:
+    build: .
+    command: ["streamlit", "run", "dashboard/app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      gateway: {condition: service_started}
+    environment:
+      # The read-only role (db/schema.sql), not DATABASE_URL -- the dashboard
+      # never writes to Postgres directly, enforced by the database itself.
+      DASHBOARD_DATABASE_URL: postgresql://unlearnshield_readonly:unlearnshield_readonly@postgres:5432/unlearnshield
+      DASHBOARD_GATEWAY_URL: http://gateway:8000
+      DASHBOARD_GATEWAY_TOKEN: ${DASHBOARD_GATEWAY_TOKEN:-dev-token}
+    ports: ["8501:8501"]

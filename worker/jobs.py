@@ -10,11 +10,15 @@ import hmac
 import os
 from itertools import groupby
 
+import numpy as np
 import psycopg2.extras
 
 from config.settings import AUDIT_KEY, CODE_DIGEST, SPOT_CHECK_RATE
+from data.eval_set import auc as compute_auc
+from data.eval_set import load as load_eval_set
 from engine.rebuild import rebuild_batch_by_ref
 from engine.train import checkpoint_path
+from inference.batched_ensemble import load_ensemble
 
 
 def _should_spot_check(erasure_id: str) -> bool:
@@ -69,6 +73,38 @@ def _promote(cur, shard: int, result_weights: str) -> None:
         INSERT INTO model_versions (model_version, shard_checkpoints, eval_set_version)
         VALUES (%s, %s, %s) ON CONFLICT (model_version) DO NOTHING
     """, (new_version, psycopg2.extras.Json(shard_checkpoints), eval_set_version))
+    record_eval(cur, new_version, shard_checkpoints)
+
+
+def record_eval(cur, model_version: str, shard_checkpoints: dict) -> float:
+    """Score the just-promoted ensemble against the frozen eval corpus and
+    record the AUC. Used at every promotion (here) and once at bootstrap
+    (scripts/load_routing.py), so the dashboard's delta chart has a baseline
+    to compare the first real rebuild against.
+
+    Real, not fabricated: it runs the actual promoted checkpoints through
+    inference.batched_ensemble against data/eval_set.py's frozen corpus. A
+    Phase 6 "accuracy chart" backed by invented numbers would be exactly the
+    kind of thing this project exists to catch someone else doing.
+    """
+    from engine.train import CHECKPOINT_DIR
+
+    cur.execute("SELECT shard, file_path FROM checkpoints WHERE checkpoint_hash = ANY(%s)",
+               (list(shard_checkpoints.values()),))
+    shard_paths = {str(shard): path for shard, path in cur.fetchall()}
+    preproc_paths = {s: os.path.join(CHECKPOINT_DIR, f"shard{s}_preproc.json") for s in shard_paths}
+
+    records = load_eval_set()
+    rows = np.arange(len(records["step"]))
+    ensemble = load_ensemble(shard_paths, preproc_paths)
+    probs = ensemble.predict_proba(records, rows)
+    score = compute_auc(records["isFraud"], probs)
+
+    cur.execute("""
+        INSERT INTO eval_results (model_version, auc, n_eval)
+        VALUES (%s, %s, %s) ON CONFLICT (model_version) DO NOTHING
+    """, (model_version, score, len(rows)))
+    return score
 
 
 # NOT IMPLEMENTED in Phase 4: re-running a sampled job and comparing weight
