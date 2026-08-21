@@ -80,3 +80,45 @@ presented as having solved the harder one.
   (for instance, a hand-built model_version row in a test) has no eval score
   and the dashboard shows "no promotions recorded yet" rather than a fabricated
   zero.
+
+---
+
+## Amendment, 2026-08-21: Streamlit replaced by a served page
+
+The security boundary above is unchanged; only the rendering layer moved.
+
+Streamlit got a working console quickly, but an ops console is almost entirely
+dense tables, status chips, and countdowns — the things it gives least control
+over. Two concrete costs showed up:
+
+- **Contrast was fought, not designed.** The SLA table's urgency highlight
+  shipped as light-pink row backgrounds while Streamlit's dark theme kept cell
+  text near-white, leaving the most urgent rows the least readable. The fix was
+  a workaround (setting an explicit `color` alongside every `background-color`)
+  rather than a design decision.
+- **Thirteen streamlit-family packages** (altair, pydeck, pyarrow, tornado,
+  gitpython, …) in an image whose other dependencies are all deliberate and
+  pinned for determinism.
+
+`dashboard/app.py` is now a small FastAPI app serving JSON plus a hand-written
+page (`dashboard/static/`). No React, no bundler, no build step — one page with
+five panels does not need a toolchain, and adding one would put a build
+artifact into review.
+
+What the change bought:
+
+- Colour is now spent only on meaning: a 2px status rail on stat cards, a left
+  rail on urgent rows, coloured *numbers* rather than tinted surfaces. The rule
+  learned from the contrast bug is written into `app.css`: colour the signal,
+  not the surface.
+- Live re-verification became a real endpoint (`GET /api/certificates/{id}`)
+  that runs `verify_certificate` per request, so it is testable with a plain
+  `TestClient` instead of Streamlit's `AppTest`.
+- All API output is escaped before reaching the DOM. `subject_ref` and
+  `last_error` are attacker-influenced in principle, and an ops console that
+  renders them as markup would be a stored-XSS hole in the tool used to
+  investigate incidents.
+
+`requirements.txt` loses `streamlit`; `docker-compose.yml`'s dashboard service
+runs `uvicorn dashboard.app:app`. The read-only role, the gateway-proxied write
+path, and the honest-AUC reasoning above all carry over unchanged.

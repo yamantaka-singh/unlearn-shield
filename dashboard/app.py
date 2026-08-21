@@ -1,203 +1,177 @@
-"""Internal ops tool. Not the product, not customer-facing.
+"""Ops console. Internal tool, not the product.
 
-Reads Postgres through the role that cannot write (db/schema.sql). The one
-write path -- "queue a rebuild now" -- goes through the gateway's own
-POST /v1/erasure exactly as any other caller would, over HTTP, using stdlib
-urllib rather than adding a requests dependency for one call. Nothing here
-touches the database with anything but SELECT.
+Replaces the original Streamlit app. Streamlit gave live data quickly but very
+little control over layout, density, and colour -- and an ops console is mostly
+dense tables and status, which is exactly what it is worst at. This serves a
+hand-written page instead: full control, no build step, no bundler, and it
+drops thirteen streamlit-family packages from the image.
 
-    streamlit run dashboard/app.py
+The security boundary from ADR 0008 is unchanged and is the reason this is a
+separate process rather than a route on the gateway: it connects through
+`unlearnshield_readonly`, a role granted SELECT only, so "the dashboard never
+writes to Postgres" is enforced by the database rather than by convention. The
+one write path -- force a rebuild -- is proxied to the gateway's own
+POST /v1/erasure exactly as any other caller would call it.
+
+    uvicorn dashboard.app:app --port 8501
 """
 
 import json
 import os
-import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-import pandas as pd
-import streamlit as st
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from config.settings import DASHBOARD_GATEWAY_TOKEN, DASHBOARD_GATEWAY_URL
 from db.conn import connect_readonly
 
-st.set_page_config(page_title="UnlearnShield Ops", layout="wide")
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
-# A fixed status->color map, not a library, and colors chosen for 4.5:1+
-# contrast against white -- pale, low-opacity chips are unreadable in light
-# mode, one of the concrete complaints a UI review would raise.
-STATUS_COLOR = {"queued": "#92400e", "processing": "#1d4ed8", "done": "#166534", "failed": "#991b1b"}
-STATUS_BG = {"queued": "#fef3c7", "processing": "#dbeafe", "done": "#dcfce7", "failed": "#fee2e2"}
+app = FastAPI(title="UnlearnShield Ops", docs_url=None, redoc_url=None)
+api = APIRouter(prefix="/api")
 
 
-def status_pill(status: str) -> str:
-    color, bg = STATUS_COLOR.get(status, "#374151"), STATUS_BG.get(status, "#f3f4f6")
-    return (f'<span style="background:{bg};color:{color};padding:2px 10px;'
-           f'border-radius:999px;font-size:0.85em;font-weight:600">{status}</span>')
+def rows(sql: str, params: tuple = ()) -> list[dict]:
+    """One short-lived read. The connection is autocommit (db/conn.py), so a
+    long-lived console never sits on an open snapshot."""
+    conn = connect_readonly()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            cols = [d.name for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
 
 
-@st.cache_resource
-def _conn():
-    return connect_readonly()
+def _iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
 
 
-def query(sql: str, params: tuple = ()) -> pd.DataFrame:
-    # A fresh cursor per call on a long-lived connection; st.cache_resource
-    # keeps the connection itself from being reopened on every Streamlit rerun,
-    # which happens on almost every widget interaction.
-    return pd.read_sql(sql, _conn(), params=params)
+@api.get("/overview")
+def overview() -> dict:
+    counts = {r["status"]: r["n"] for r in
+              rows("SELECT status, count(*) AS n FROM erasure_jobs GROUP BY status")}
+    by_shard = rows("""
+        SELECT shard, status, count(*) AS n FROM erasure_jobs
+        GROUP BY shard, status ORDER BY shard
+    """)
+    current = rows("""
+        SELECT m.model_version, m.promoted_at, e.auc, e.n_eval
+        FROM model_versions m LEFT JOIN eval_results e USING (model_version)
+        ORDER BY m.promoted_at DESC LIMIT 1
+    """)
+    history = rows("""
+        SELECT model_version, auc, n_eval, computed_at
+        FROM eval_results ORDER BY computed_at
+    """)
+    drift = rows("SELECT count(*) AS n FROM reproducibility_checks WHERE NOT matched")
+
+    return {
+        "counts": {k: counts.get(k, 0)
+                   for k in ("queued", "processing", "done", "failed")},
+        "by_shard": [{**r} for r in by_shard],
+        "current_model": ({**current[0], "promoted_at": _iso(current[0]["promoted_at"])}
+                          if current else None),
+        "eval_history": [{**r, "computed_at": _iso(r["computed_at"])} for r in history],
+        "drift_failures": drift[0]["n"] if drift else 0,
+        "subjects_routed": rows("SELECT count(*) AS n FROM subject_shard_map")[0]["n"],
+    }
 
 
-st.title("UnlearnShield — Ops")
-st.caption("Internal visibility only. Every write goes through the gateway's own API.")
+@api.get("/pending")
+def pending() -> list[dict]:
+    now = datetime.now(timezone.utc)
+    out = []
+    for r in rows("""
+        SELECT erasure_id, subject_ref, shard, reason, status, attempts,
+               last_error, sla_deadline, created_at
+        FROM erasure_jobs WHERE status IN ('queued', 'processing')
+        ORDER BY sla_deadline ASC LIMIT 100
+    """):
+        out.append({**r,
+                    "erasure_id": str(r["erasure_id"]),
+                    "hours_remaining": round((r["sla_deadline"] - now).total_seconds() / 3600, 1),
+                    "sla_deadline": _iso(r["sla_deadline"]),
+                    "created_at": _iso(r["created_at"])})
+    return out
 
-if st.button("Refresh"):
-    st.cache_resource.clear()
-    st.rerun()
 
-st.divider()
+@api.get("/failed")
+def failed() -> list[dict]:
+    return [{**r, "erasure_id": str(r["erasure_id"]), "completed_at": _iso(r["completed_at"])}
+            for r in rows("""
+                SELECT erasure_id, subject_ref, shard, reason, attempts, last_error, completed_at
+                FROM erasure_jobs WHERE status = 'failed'
+                ORDER BY completed_at DESC NULLS LAST LIMIT 50
+            """)]
 
-# ---------------------------------------------------------------- queue health
-st.header("Queue health")
 
-jobs = query("SELECT shard, status, count(*) AS n FROM erasure_jobs GROUP BY shard, status")
-if jobs.empty:
-    st.info("No erasure jobs yet.")
-else:
-    pivot = jobs.pivot(index="shard", columns="status", values="n").fillna(0)
-    for col in ("queued", "processing", "done", "failed"):
-        if col not in pivot.columns:
-            pivot[col] = 0
-    st.bar_chart(pivot[["queued", "processing", "done", "failed"]])
+@api.get("/certificates")
+def certificates() -> list[dict]:
+    return [{**r, "erasure_id": str(r["erasure_id"]), "created_at": _iso(r["created_at"])}
+            for r in rows("""
+                SELECT erasure_id, shard, model_version, created_at
+                FROM erasure_manifests ORDER BY created_at DESC LIMIT 200
+            """)]
 
-st.divider()
 
-# ------------------------------------------------------------ pending erasures
-st.header("Pending erasures")
+@api.get("/certificates/{erasure_id}")
+def certificate(erasure_id: str) -> dict:
+    """Returns the manifest AND a live re-verification of it.
 
-pending = query("""
-    SELECT erasure_id, subject_ref, shard, reason, status, sla_deadline, created_at
-    FROM erasure_jobs WHERE status IN ('queued', 'processing')
-    ORDER BY sla_deadline ASC
-""")
+    Re-verified on every request rather than cached: the whole point of
+    shipping a certificate is that anyone can check it independently, and a
+    stored "it passed once" flag is an assertion, not a proof.
+    """
+    found = rows("SELECT manifest_json FROM erasure_manifests WHERE erasure_id = %s",
+                 (erasure_id,))
+    if not found:
+        raise HTTPException(404, "no certificate for that erasure_id")
+    manifest = found[0]["manifest_json"]
 
-if pending.empty:
-    st.success("Nothing pending.")
-else:
-    now = pd.Timestamp.now(tz=timezone.utc)
-    pending["sla_deadline"] = pd.to_datetime(pending["sla_deadline"], utc=True)
-    remaining = pending["sla_deadline"] - now
-    pending["hours_remaining"] = (remaining.dt.total_seconds() / 3600).round(1)
-    pending["subject_ref"] = pending["subject_ref"].str[:16] + "…"
+    from verify.sign import load_public_key
+    from verify.verifier_cli import verify_certificate
+    ok, findings = verify_certificate(dict(manifest), load_public_key())
+    return {"manifest": manifest, "verified": ok, "findings": findings}
 
-    def urgency_row(row):
-        # Text color set explicitly alongside the background, not left to
-        # inherit: this highlight is always a light chip, but Streamlit's
-        # dark theme keeps default cell text near-white, which put light
-        # gray text on light pink -- unreadable. Caught by actually looking
-        # at the rendered page, not by reading the code.
-        if row["hours_remaining"] < 24:
-            return ["background-color: #fee2e2; color: #991b1b"] * len(row)
-        if row["hours_remaining"] < 24 * 7:
-            return ["background-color: #fef3c7; color: #92400e"] * len(row)
-        return [""] * len(row)
 
-    display = pending[["erasure_id", "subject_ref", "shard", "reason", "status", "hours_remaining"]]
-    styled = display.style.apply(urgency_row, axis=1).format({"hours_remaining": "{:.1f}"})
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-    st.caption("Red: under 24h to SLA deadline. Amber: under 7 days.")
+class RebuildRequest(BaseModel):
+    subject_id: str
+    reason: str
 
-st.divider()
 
-# --------------------------------------------------------------- eval accuracy
-st.header("Model accuracy (frozen eval set)")
+@api.post("/rebuild")
+def force_rebuild(body: RebuildRequest) -> dict:
+    """Proxied to the gateway's own POST /v1/erasure -- the same path any other
+    caller uses. This process holds no write credentials for Postgres and could
+    not insert the row itself even if this code tried to."""
+    if not body.subject_id.strip():
+        raise HTTPException(400, "subject_id is required")
+    payload = json.dumps({"subject_id": body.subject_id, "reason": body.reason}).encode()
+    request = urllib.request.Request(
+        f"{DASHBOARD_GATEWAY_URL}/v1/erasure", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {DASHBOARD_GATEWAY_TOKEN}",
+                 "Idempotency-Key": f"ops-{body.subject_id}-{datetime.now(timezone.utc).timestamp()}",
+                 "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            return {"ok": True, "response": json.loads(resp.read())}
+    except urllib.error.HTTPError as e:
+        raise HTTPException(e.code, f"gateway rejected the request: {e.read().decode()[:400]}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"could not reach the gateway at {DASHBOARD_GATEWAY_URL}: {e.reason}")
 
-evals = query("""
-    SELECT model_version, auc, n_eval, computed_at FROM eval_results ORDER BY computed_at
-""")
-if evals.empty:
-    st.info("No promotions recorded yet. Run scripts.load_routing after a build.")
-else:
-    evals["delta"] = evals["auc"].diff()
-    st.line_chart(evals.set_index("computed_at")["auc"])
-    latest = evals.iloc[-1]
-    delta = latest["delta"] if pd.notna(latest["delta"]) else 0.0
-    st.metric(f"Current: {latest['model_version']}", f"{latest['auc']:.4f} AUC",
-             f"{delta:+.4f} vs previous promotion")
-    st.caption(f"Scored against a frozen {int(latest['n_eval'])}-row synthetic eval set "
-              f"with no subject_ref -- it cannot be the target of an erasure, so it needs "
-              f"no purge-state of its own.")
 
-st.divider()
+app.include_router(api)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ------------------------------------------------------------- certificate viewer
-st.header("Certificate viewer")
 
-completed = query("""
-    SELECT m.erasure_id, m.model_version, m.created_at
-    FROM erasure_manifests m ORDER BY m.created_at DESC LIMIT 200
-""")
-
-if completed.empty:
-    st.info("No certificates yet.")
-else:
-    completed["erasure_id"] = completed["erasure_id"].astype(str)
-    options = completed["erasure_id"].tolist()
-    labels = {row["erasure_id"]: f"{row['erasure_id']} — {row['model_version']} — {row['created_at']}"
-             for _, row in completed.iterrows()}
-    chosen = st.selectbox("Erasure ID", options, format_func=lambda x: labels[x])
-
-    manifest_row = query(
-        "SELECT manifest_json FROM erasure_manifests WHERE erasure_id = %(id)s",
-        params={"id": chosen})
-    manifest = manifest_row.iloc[0]["manifest_json"]
-
-    col1, col2 = st.columns([3, 2])
-    with col1:
-        st.json(manifest)
-    with col2:
-        st.subheader("Live re-verification")
-        # Genuinely re-runs verify/verifier_cli against this certificate right
-        # now -- not a cached "it passed once" flag. That is the entire point
-        # of shipping a certificate: anyone, including this dashboard, can
-        # check it independently.
-        from verify.sign import load_public_key
-        from verify.verifier_cli import verify_certificate
-
-        ok, findings = verify_certificate(dict(manifest), load_public_key())
-        (st.success if ok else st.error)("VERIFIED" if ok else "REJECTED")
-        for line in findings:
-            st.text(line)
-
-st.divider()
-
-# ------------------------------------------------------------ force rebuild now
-st.header("Force rebuild now")
-st.caption("Goes through POST /v1/erasure on the gateway -- the same path any "
-          "other caller uses. This page never writes to Postgres directly.")
-
-with st.form("force_rebuild"):
-    subject_id = st.text_input("Subject ID")
-    reason = st.selectbox("Reason", ["consent_revocation", "fraud_excision"])
-    submitted = st.form_submit_button("Queue erasure")
-
-if submitted:
-    if not subject_id.strip():
-        st.warning("Subject ID is required.")
-    else:
-        body = json.dumps({"subject_id": subject_id, "reason": reason}).encode()
-        req = urllib.request.Request(
-            f"{DASHBOARD_GATEWAY_URL}/v1/erasure", data=body, method="POST",
-            headers={"Authorization": f"Bearer {DASHBOARD_GATEWAY_TOKEN}",
-                    "Idempotency-Key": f"dashboard-{subject_id}-{datetime.now(timezone.utc).timestamp()}",
-                    "content-type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                st.success(f"Queued: {resp.read().decode()}")
-        except urllib.error.HTTPError as e:
-            st.error(f"Gateway rejected the request ({e.code}): {e.read().decode()}")
-        except urllib.error.URLError as e:
-            st.error(f"Could not reach the gateway at {DASHBOARD_GATEWAY_URL}: {e.reason}")
+@app.get("/")
+def index():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))

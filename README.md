@@ -8,7 +8,7 @@ Remove a subject from a trained model and get back a signed certificate
 an auditor can verify — without access to your training system, your
 database, or your weights.
 
-[![tests](https://img.shields.io/badge/tests-213_passing-2ea043?style=flat-square)](#testing)
+[![tests](https://img.shields.io/badge/tests-218_passing-2ea043?style=flat-square)](#testing)
 [![p99](https://img.shields.io/badge/predict_p99-9.8ms-2ea043?style=flat-square)](#serving-latency)
 [![proof leak](https://img.shields.io/badge/subjects_leaked_per_proof-0-2ea043?style=flat-square)](#absence-proofs-that-name-nobody)
 [![python](https://img.shields.io/badge/python-3.11-3776ab?style=flat-square)](https://www.python.org)
@@ -213,29 +213,30 @@ job row says `done`.
 
 ## Ops dashboard
 
-`streamlit run dashboard/app.py` — queue depth per shard, an SLA countdown
-table, a certificate viewer that **re-verifies live** (not a cached pass/fail),
-an accuracy chart, and a "force rebuild now" button.
+```bash
+uvicorn dashboard.app:app --port 8501
+```
 
-That button is a `POST /v1/erasure` through stdlib `urllib`, exactly like any
-other caller — the dashboard has no other write path, and the database
-enforces it: it connects through `unlearnshield_readonly`, a role granted
-`SELECT` only. Verified directly, not assumed — an `INSERT` through that role
-raises `psycopg2.errors.InsufficientPrivilege`.
+Queue depth per shard, an SLA countdown with urgency banding, a certificate
+viewer that **re-verifies live** on every request (not a cached pass/fail), an
+eval-AUC trend, and a force-rebuild form.
 
-The accuracy chart is a real AUC, not a plausible one. `worker/jobs.py`
-scores every promotion against a frozen, synthetic, non-subject eval corpus
-(`data/eval_set.py`) using the exact ensemble code that serves real traffic —
-two real promotions in testing produced `0.5151` and `0.5158`, not `1.0`, not
-round numbers chosen to look finished. → [ADR 0008](docs/adr/0008-dashboard-readonly-role-and-honest-eval.md)
+That form is a `POST /v1/erasure` to the gateway, exactly like any other
+caller — the console has no other write path, and the database enforces it: it
+connects through `unlearnshield_readonly`, a role granted `SELECT` only. An
+`INSERT` through that role raises `psycopg2.errors.InsufficientPrivilege`, and
+a test asserts exactly that.
 
-Building it caught three real bugs by actually running the thing rather than
-reading the code: a `uuid.UUID`/`str` key mismatch that crashed the
-certificate selector, light-pink row highlights with no explicit text color
-(nearly invisible under Streamlit's dark theme), and a deadlock where the
-dashboard's cached connection held an open transaction indefinitely, blocking
-a later database operation — fixed at the root (`autocommit=True` on a
-connection that only ever reads) rather than papered over.
+The accuracy trend is a real AUC, not a plausible one. `worker/jobs.py` scores
+every promotion against a frozen, synthetic, non-subject eval corpus
+(`data/eval_set.py`) using the exact ensemble code that serves real traffic.
+→ [ADR 0008](docs/adr/0008-dashboard-readonly-role-and-honest-eval.md)
+
+It was a Streamlit app through Phase 6. Streamlit gave live data quickly and
+very little control over density, layout, and colour — and an ops console is
+mostly dense tables and status, which is what it handles worst. It now serves
+a hand-written page from FastAPI: full control, no build step, no bundler, and
+thirteen fewer packages in the image.
 
 ```bash
 export UNLEARNSHIELD_SIGNING_KEY=$(cat .signing_key)   # required for every compose command,
@@ -357,7 +358,7 @@ PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 1
 
 docker compose up -d postgres
 DATABASE_URL=postgresql://unlearnshield:unlearnshield@localhost:55432/unlearnshield \
-  .venv/bin/python -m pytest tests/integration tests/e2e -q                  # 43, real Postgres
+  .venv/bin/python -m pytest tests/integration tests/e2e -q                  # 48, real Postgres
 ```
 
 Integration and e2e tests **skip** rather than fail when Postgres is
@@ -377,7 +378,7 @@ suite runs wherever a database exists.
 | `test_e2e_erasure` | Enqueue → worker → certificate → verify → predict reflects it |
 | `test_eval_set` | Hand-rolled AUC vs. brute-force pairwise count, degenerate classes |
 | `test_eval_results` | A promotion's AUC matches an independent recomputation |
-| `test_dashboard` | Runs the real Streamlit app via `AppTest`; live certificate re-verification |
+| `test_dashboard` | Console API; live certificate re-verification; read-only role refuses writes |
 | `test_gbdt` | Truncation is exact; rebuild is byte-identical to a clean retrain; real certificate verifies |
 | `test_spot_check` | Re-runs a real rebuild; detects a forced divergence; leaves checkpoints untouched |
 | `test_idempotency` | Replay dedupe, and that one principal's key never returns another's job |

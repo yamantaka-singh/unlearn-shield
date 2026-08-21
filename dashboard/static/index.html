@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UnlearnShield — Ops</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>UnlearnShield</h1>
+    <span class="sub">ops console · read-only</span>
+    <span class="spacer"></span>
+    <span class="model-pill" id="model-pill">—</span>
+    <button id="refresh">Refresh</button>
+  </header>
+
+  <main>
+    <div id="drift-banner"></div>
+
+    <section class="stats" id="stats" aria-label="Queue summary"></section>
+
+    <div class="columns">
+      <div>
+        <section class="panel">
+          <h2>Queue by shard</h2>
+          <div class="body" id="shards"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Pending erasures <span class="count" id="pending-count"></span></h2>
+          <div class="body flush" id="pending"></div>
+        </section>
+
+        <section class="panel" id="failed-panel" hidden>
+          <h2>Failed <span class="count" id="failed-count"></span></h2>
+          <div class="body flush" id="failed"></div>
+        </section>
+      </div>
+
+      <div>
+        <section class="panel">
+          <h2>Eval AUC by promotion</h2>
+          <div class="body" id="auc"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Force rebuild</h2>
+          <div class="body">
+            <form id="rebuild-form">
+              <div class="field">
+                <label for="subject">Subject ID</label>
+                <input id="subject" name="subject" placeholder="C0000042" autocomplete="off">
+              </div>
+              <div class="field">
+                <label for="reason">Reason</label>
+                <select id="reason" name="reason">
+                  <option value="consent_revocation">consent_revocation</option>
+                  <option value="fraud_excision">fraud_excision</option>
+                </select>
+              </div>
+              <button class="primary" type="submit">Queue erasure</button>
+            </form>
+            <p class="form-note">
+              Proxied to the gateway's <span class="mono">POST /v1/erasure</span>, the same
+              path any caller uses. This console holds no write credentials for Postgres.
+            </p>
+            <div id="rebuild-result"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <section class="panel">
+      <h2>Certificates <span class="count" id="cert-count"></span></h2>
+      <div class="body flush">
+        <div class="cert-layout">
+          <div class="cert-list" id="cert-list"></div>
+          <div class="cert-detail" id="cert-detail">
+            <div class="empty">Select a certificate to verify it.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
