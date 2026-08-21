@@ -4,5 +4,6 @@ __pycache__/
 .pytest_cache/
 checkpoints/
 data/*.parquet
+data/shards/
 .env
 *.key
