@@ -8,7 +8,7 @@ Remove a subject from a trained model and get back a signed certificate
 an auditor can verify — without access to your training system, your
 database, or your weights.
 
-[![tests](https://img.shields.io/badge/tests-197_passing-2ea043?style=flat-square)](#testing)
+[![tests](https://img.shields.io/badge/tests-208_passing-2ea043?style=flat-square)](#testing)
 [![p99](https://img.shields.io/badge/predict_p99-9.8ms-2ea043?style=flat-square)](#serving-latency)
 [![proof leak](https://img.shields.io/badge/subjects_leaked_per_proof-0-2ea043?style=flat-square)](#absence-proofs-that-name-nobody)
 [![python](https://img.shields.io/badge/python-3.11-3776ab?style=flat-square)](https://www.python.org)
@@ -63,7 +63,7 @@ spread is the entire point.
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements-dev.txt
 
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 154 tests, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 165 tests, no database
 ```
 
 `PYTHONHASHSEED` must be set before the interpreter starts, so the determinism
@@ -152,6 +152,20 @@ re-running in the same worker pass needs nothing extra.
 `test_spot_check_detects_a_genuine_divergence` is the negative control, because
 a check that only ever passes proves nothing.
 → [ADR 0010](docs/adr/0010-hardening-findings.md)
+
+### Trees, where rollback is just truncation
+
+Most production tabular fraud models are GBDTs, not neural nets. `engine/gbdt.py`
+is the tree half, and it fits SISA *better* than the MLP path: rolling back to
+slice *i* means keeping the trees earlier slices produced, and `booster[0:n]` is
+bit-identical to having trained only *n* rounds.
+
+A rebuild is therefore **byte-identical to a clean retrain on the retained
+data** — not "behaves similarly", which is what gradient-ascent unlearning
+offers. Measured cost by the target's slice: 20% of a full build at slice 4,
+72% at slice 0. One booster file per shard instead of five checkpoints plus a
+preprocessor, and no fitted per-shard statistic at all, since trees are
+invariant to feature scaling. → [ADR 0011](docs/adr/0011-gbdt-sisa.md)
 
 ### Deterministic retraining
 
@@ -323,8 +337,7 @@ no `subject_id` could never be reached by an erasure.
 → [ADR 0009](docs/adr/0009-shard-disagreement-review-queue.md)
 
 Evaluated and deliberately **not** built, with reasoning in
-[docs/roadmap-assessment.md](docs/roadmap-assessment.md): GBDT/XGBoost SISA
-(genuinely valuable, largest real item — deferred, not dismissed), ZK-SNARK
+[docs/roadmap-assessment.md](docs/roadmap-assessment.md): ZK-SNARK
 proofs, graph/vector unlearning, dynamic re-sharding, Kafka and warehouse CDC
 connectors, ONNX and Rust inference.
 
@@ -333,7 +346,7 @@ connectors, ONNX and Rust inference.
 ## Testing
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 154, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 165, no database
 
 docker compose up -d postgres
 DATABASE_URL=postgresql://unlearnshield:unlearnshield@localhost:55432/unlearnshield \
@@ -358,6 +371,7 @@ suite runs wherever a database exists.
 | `test_eval_set` | Hand-rolled AUC vs. brute-force pairwise count, degenerate classes |
 | `test_eval_results` | A promotion's AUC matches an independent recomputation |
 | `test_dashboard` | Runs the real Streamlit app via `AppTest`; live certificate re-verification |
+| `test_gbdt` | Truncation is exact; rebuild is byte-identical to a clean retrain |
 | `test_spot_check` | Re-runs a real rebuild; detects a forced divergence; leaves checkpoints untouched |
 | `test_idempotency` | Replay dedupe, and that one principal's key never returns another's job |
 | `test_disagreement` | Optional review queue; schema guard against storing unerasable features |

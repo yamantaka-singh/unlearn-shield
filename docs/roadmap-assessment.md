@@ -1,9 +1,9 @@
 # Roadmap assessment
 
-An "enterprise-grade" expansion proposal was evaluated on 2026-08-21. Two items
-were built, one is deferred as genuinely valuable, and the rest were declined
-with reasons. Recorded here so the same proposals do not get re-litigated from
-scratch, and so the declines can be argued with.
+An "enterprise-grade" expansion proposal was evaluated on 2026-08-21. Three
+items were built, and the rest were declined with reasons. Recorded here so
+the same proposals do not get re-litigated from scratch, and so the declines
+can be argued with.
 
 ## Built
 
@@ -29,9 +29,11 @@ Pooling and caching took p50 from 13.3 ms to 3.5 ms and p99 from 45.9 ms to
 inference stack. Batching was implemented too, and it is the smallest of the
 three wins.
 
-## Deferred — genuinely valuable
+### GBDT / XGBoost SISA — BUILT
 
-### GBDT / XGBoost SISA
+*Assessed as the strongest deferred item; built 2026-08-21, see
+[ADR 0011](adr/0011-gbdt-sisa.md). Original assessment kept below because the
+predictions in it were checked rather than assumed, and one was wrong.*
 
 **The strongest idea in the proposal, and the one most worth building next.**
 The premise is correct: most production tabular fraud models are gradient
@@ -52,9 +54,25 @@ slice-rollback maps onto boosting *more* cleanly than onto gradient descent:
   the same non-associative-float reason documented in
   [ADR 0003](adr/0003-cpu-only-determinism.md).
 
-Deferred because it is a second engine — its own training path, determinism
-verification, checkpoint format, and serving path — not because it is doubtful.
-It is the top of the queue after Phase 6.
+Deferred at assessment time because it is a second engine — its own training
+path, determinism verification, checkpoint format, and serving path — not
+because it was doubtful.
+
+**Outcome.** Every prediction above was checked rather than assumed, and all
+held except one. "Rollback is exact and nearly free" and "determinism fits the
+existing doctrine" are now measured facts: truncation is bit-identical to
+training fewer rounds, and a rebuild is byte-identical to a clean retrain on
+retained data. The preprocessing prediction held too — no fitted per-shard
+statistic remains.
+
+The exception was an intermediate claim, made while building, that XGBoost's
+fitted `base_score` carried erased subjects into rebuilt models. Measured in
+the real code path it does not: the estimate is drawn from slice 0 only, and a
+slice-0 erasure restarts training anyway. It is pinned regardless, because that
+safety is incidental rather than designed. ADR 0011 records the correction.
+
+The offline engine is done. Serving is not, and needs its own decision —
+`inference/batched_ensemble.py` is PyTorch-specific with no tree analogue.
 
 ## Declined
 
