@@ -34,7 +34,13 @@ CREATE TABLE erasure_jobs (
     -- NOT NULL, not just UNIQUE: nullable-unique lets every request with a
     -- missing header through, so "Idempotency-Key required" would be enforced
     -- only by app code that a retry path can bypass.
-    idempotency_key TEXT NOT NULL UNIQUE,
+    --
+    -- Uniqueness is (requested_by, idempotency_key), declared below -- NOT on
+    -- idempotency_key alone. A global unique made the key collide across
+    -- callers: the second caller got the first one's erasure_id back, and its
+    -- own request was silently never enqueued while still returning 202. See
+    -- migration 0004.
+    idempotency_key TEXT NOT NULL,
 
     -- A rebuild runs for minutes. Holding the SKIP LOCKED transaction open that
     -- whole time bloats Postgres and strands the job in 'processing' forever if
@@ -48,7 +54,10 @@ CREATE TABLE erasure_jobs (
     sla_deadline    TIMESTAMPTZ NOT NULL,
     requested_by    TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at    TIMESTAMPTZ
+    completed_at    TIMESTAMPTZ,
+
+    CONSTRAINT erasure_jobs_principal_idempotency_key
+        UNIQUE (requested_by, idempotency_key)
 );
 CREATE INDEX erasure_jobs_poll_idx ON erasure_jobs (status, shard, sla_deadline)
     WHERE status IN ('queued','processing');

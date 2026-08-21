@@ -8,7 +8,7 @@ Remove a subject from a trained model and get back a signed certificate
 an auditor can verify — without access to your training system, your
 database, or your weights.
 
-[![tests](https://img.shields.io/badge/tests-190_passing-2ea043?style=flat-square)](#testing)
+[![tests](https://img.shields.io/badge/tests-197_passing-2ea043?style=flat-square)](#testing)
 [![p99](https://img.shields.io/badge/predict_p99-9.8ms-2ea043?style=flat-square)](#serving-latency)
 [![proof leak](https://img.shields.io/badge/subjects_leaked_per_proof-0-2ea043?style=flat-square)](#absence-proofs-that-name-nobody)
 [![python](https://img.shields.io/badge/python-3.11-3776ab?style=flat-square)](https://www.python.org)
@@ -137,6 +137,21 @@ naming them.
 
 Both numbers are asserted in `test_proof_names_no_other_subject`, not claimed
 here. → [ADR 0007](docs/adr/0007-sparse-merkle-and-serving-latency.md)
+
+### The spot-check actually re-runs
+
+`SPOT_CHECK_RATE` of completed erasures are rebuilt a second time and their
+weight digests compared. Selection is `HMAC(erasure_id, audit_key)`, so an
+operator cannot steer the sample away from jobs it would rather not have
+re-checked, and an auditor holding `audit_key` can recompute which jobs should
+have been sampled.
+
+Phase 4 deferred this believing it needed a pre-purge snapshot. It doesn't —
+the retained data *is* what the shard holds immediately after a rebuild, so
+re-running in the same worker pass needs nothing extra.
+`test_spot_check_detects_a_genuine_divergence` is the negative control, because
+a check that only ever passes proves nothing.
+→ [ADR 0010](docs/adr/0010-hardening-findings.md)
 
 ### Deterministic retraining
 
@@ -273,12 +288,6 @@ should not have to read the source to learn what they were not shown.
 Stated rather than buried. Both surfaced from running the system, not from
 reading it.
 
-**The reproducibility spot-check selects but does not yet re-run.** Sample
-selection is real and tested; the second rebuild needs pre-purge shard state
-that nothing snapshots. Writing a fabricated `matched=true` row would corrupt
-the one table a drift alert depends on, so nothing is written instead of
-something false.
-
 **Offline mutation is not transactional with Postgres.** A DB failure after a
 successful rebuild needs manual reconciliation, not a retry — the retry would
 call into a routing table that no longer lists the subject and fail with an
@@ -303,7 +312,7 @@ covers.
 | 4 — Gateway & worker | done | FastAPI, Postgres queue with leases, idempotent intake |
 | 5 — Serving | done | Connection pooling, ensemble cache, batched inference |
 | 6 — Ops dashboard | done | Queue depth, live-reverifying certificate viewer, honest accuracy chart |
-| 7 — Hardening | next | Spot-check re-run, load ceiling, incident runbooks |
+| 7 — Hardening | done | Spot-check re-run, security fix, load ceiling, [runbook](docs/runbook.md) |
 
 **Optional, off by default:** a shard-disagreement review queue
 (`DISAGREEMENT_THRESHOLD`). Spread across shards scores AUC 0.574 as a fraud
@@ -328,7 +337,7 @@ PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 1
 
 docker compose up -d postgres
 DATABASE_URL=postgresql://unlearnshield:unlearnshield@localhost:55432/unlearnshield \
-  .venv/bin/python -m pytest tests/integration tests/e2e -q                  # 36, real Postgres
+  .venv/bin/python -m pytest tests/integration tests/e2e -q                  # 43, real Postgres
 ```
 
 Integration and e2e tests **skip** rather than fail when Postgres is
@@ -349,11 +358,15 @@ suite runs wherever a database exists.
 | `test_eval_set` | Hand-rolled AUC vs. brute-force pairwise count, degenerate classes |
 | `test_eval_results` | A promotion's AUC matches an independent recomputation |
 | `test_dashboard` | Runs the real Streamlit app via `AppTest`; live certificate re-verification |
+| `test_spot_check` | Re-runs a real rebuild; detects a forced divergence; leaves checkpoints untouched |
+| `test_idempotency` | Replay dedupe, and that one principal's key never returns another's job |
+| `test_disagreement` | Optional review queue; schema guard against storing unerasable features |
 
 ---
 
 <div align="center">
 
+**[Runbook](docs/runbook.md)** ·
 **[Implementation plan](docs/implementation-plan.md)** ·
 **[Plan corrections](docs/plan-corrections.md)** ·
 **[Decision records](docs/adr/)** ·

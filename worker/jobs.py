@@ -7,7 +7,9 @@ a multi-minute rebuild never holds a Postgres transaction open.
 
 import hashlib
 import hmac
+import logging
 import os
+import tempfile
 from itertools import groupby
 
 import numpy as np
@@ -17,7 +19,7 @@ from config.settings import AUDIT_KEY, CODE_DIGEST, SPOT_CHECK_RATE
 from data.eval_set import auc as compute_auc
 from data.eval_set import load as load_eval_set
 from engine.rebuild import rebuild_batch_by_ref
-from engine.train import checkpoint_path
+from engine.train import checkpoint_path, train_shard
 from inference.batched_ensemble import load_ensemble
 
 
@@ -107,15 +109,53 @@ def record_eval(cur, model_version: str, shard_checkpoints: dict) -> float:
     return score
 
 
-# NOT IMPLEMENTED in Phase 4: re-running a sampled job and comparing weight
-# digests needs the pre-purge shard state, which nothing currently snapshots --
-# engine/rebuild.py purges in place. Writing a `reproducibility_checks` row
-# without an actual second rebuild would fabricate a "matched" result for a
-# check that never ran, which is worse than not having the check at all: it
-# corrupts the one table Phase 7's drift alert reads. `_should_spot_check`
-# below is real and tested (the HMAC-gated sample selection Phase 4c asks
-# for); wire the re-run itself once shard snapshotting exists, and only then
-# start writing to reproducibility_checks.
+def run_spot_check(cur, erasure_id: str, shard: int, replay: dict,
+                   expected_weights: str) -> bool:
+    """Re-run this rebuild and compare weight digests. Returns whether it matched.
+
+    Phase 4 deferred this on the belief that it needed a pre-purge snapshot of
+    the shard. It does not. The claim being checked is "retraining from
+    `resumed_from` on the retained data yields `result_weights`" -- and the
+    retained data is precisely what the shard holds right now, immediately
+    after the rebuild. Re-running here, in the same worker pass, is the one
+    moment the inputs are still exactly what the manifest describes; a later
+    rebuild of the same shard would move them.
+
+    Writes into a temporary directory, never the real checkpoint paths.
+    Overwriting them would be harmless when the check passes and actively
+    destructive when it fails -- leaving the next rebuild to resume from
+    divergent weights that match no recorded hash.
+
+    What this proves: the rebuild is reproducible, so nondeterminism has not
+    crept in via a thread-count change, a library upgrade, or a DataLoader
+    edit. What it does NOT prove: that a determined operator ran the rebuild
+    honestly -- running the same code twice agrees with itself either way.
+    That gap is the one ADR 0002 records against `code_digest`.
+    """
+    with tempfile.TemporaryDirectory(prefix="unlearnshield-spotcheck-") as scratch:
+        digests = train_shard(shard, records=replay["records"],
+                              from_slice=replay["from_slice"],
+                              resume_state=replay["resume_state"],
+                              seed=replay["seed"], checkpoint_dir=scratch)
+    observed = digests[max(digests)]
+    matched = observed == expected_weights
+
+    cur.execute("""
+        INSERT INTO reproducibility_checks
+            (erasure_id, expected_weights, observed_weights, matched, code_digest)
+        VALUES (%s, %s, %s, %s, %s) ON CONFLICT (erasure_id) DO NOTHING
+    """, (erasure_id, expected_weights, observed, matched, CODE_DIGEST))
+
+    if not matched:
+        # Loud, and not swallowed: a determinism drift means every manifest
+        # issued under this code_digest is unverifiable by re-run, which is
+        # the whole audit mechanism. Phase 7's runbook covers the response.
+        logging.error(
+            "DETERMINISM DRIFT: erasure %s shard %s re-ran to %s, manifest claims %s "
+            "(code_digest %s). Manifests under this code_digest cannot be "
+            "independently re-verified until resolved.",
+            erasure_id, shard, observed[:16], expected_weights[:16], CODE_DIGEST)
+    return matched
 
 
 def process_claimed(cur, jobs: list[dict]) -> None:
@@ -183,6 +223,14 @@ def process_claimed(cur, jobs: list[dict]) -> None:
                   [j["erasure_id"] for j in group]))
             continue
 
+        # Selection is HMAC-gated, so which jobs get re-run is not the
+        # worker's choice. Runs after the bookkeeping commits: a spot-check
+        # failure must not roll back an erasure that genuinely happened.
         for job in group:
             if _should_spot_check(job["erasure_id"]):
-                pass  # selected for spot-check; re-run not wired yet, see note above
+                try:
+                    run_spot_check(cur, job["erasure_id"], shard,
+                                   result["replay"], result["result_weights"])
+                except Exception as exc:
+                    logging.error("spot-check for %s could not run: %s",
+                                  job["erasure_id"], exc)

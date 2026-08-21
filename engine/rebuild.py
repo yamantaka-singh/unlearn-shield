@@ -133,6 +133,14 @@ def rebuild_batch_by_ref(refs: list, seed: int = SEED, sign: bool = True) -> dic
         "slices_retrained": list(range(min_slice, NUM_SLICES)),
         "result_weights": result_weights,
         "manifests": manifests,  # subject_ref -> signed manifest
+        # Everything needed to re-run this exact rebuild, for the
+        # reproducibility spot-check (worker/jobs.py). Returned rather than
+        # re-derived because `records` here is the post-purge shard state --
+        # after this returns, the routing rows are gone and a later rebuild of
+        # the same shard would mutate the file further, so this is the only
+        # moment the inputs are still exactly what the manifest describes.
+        "replay": {"records": records, "from_slice": min_slice,
+                   "resume_state": resume_state, "seed": seed},
     }
 
 

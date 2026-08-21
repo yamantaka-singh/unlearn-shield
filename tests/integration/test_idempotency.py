@@ -61,3 +61,45 @@ def test_idempotency_key_is_required_at_the_schema_level(pg):
             assert False, "NULL idempotency_key should have been rejected"
         except psycopg2.errors.NotNullViolation:
             pg.rollback()
+
+
+def test_key_is_scoped_per_principal(pg):
+    """Phase 7 security fix. Keyed globally, one caller's Idempotency-Key
+    collided with another's: the second caller received the FIRST caller's
+    erasure_id, and its own request was silently never enqueued while still
+    returning 202 -- a legally-required erasure reporting success without
+    happening.
+    """
+    ref = uuid4().hex
+    with pg, pg.cursor() as cur:
+        id_a, created_a = insert_or_get(
+            cur, subject_ref=ref, reason="fraud_excision", shard=0,
+            idempotency_key="same-key", sla_deadline=_deadline(), requested_by="tenant-a")
+        id_b, created_b = insert_or_get(
+            cur, subject_ref=ref, reason="consent_revocation", shard=0,
+            idempotency_key="same-key", sla_deadline=_deadline(), requested_by="tenant-b")
+
+    assert created_a and created_b, "both principals' requests must be enqueued"
+    assert id_a != id_b, "one principal must never receive another's erasure_id"
+
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT requested_by, reason FROM erasure_jobs
+            WHERE idempotency_key = 'same-key' ORDER BY requested_by
+        """)
+        assert cur.fetchall() == [("tenant-a", "fraud_excision"),
+                                  ("tenant-b", "consent_revocation")]
+
+
+def test_same_principal_replay_still_dedupes(pg):
+    """The fix must not weaken idempotency for the case it exists for."""
+    ref = uuid4().hex
+    with pg, pg.cursor() as cur:
+        first, created = insert_or_get(
+            cur, subject_ref=ref, reason="fraud_excision", shard=0,
+            idempotency_key="replay", sla_deadline=_deadline(), requested_by="tenant-a")
+        again, created_again = insert_or_get(
+            cur, subject_ref=ref, reason="fraud_excision", shard=0,
+            idempotency_key="replay", sla_deadline=_deadline(), requested_by="tenant-a")
+    assert created and not created_again
+    assert first == again

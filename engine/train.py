@@ -33,8 +33,8 @@ def shard_path(shard: int) -> str:
     return os.path.join(SHARD_DIR, f"shard{shard}.npz")
 
 
-def checkpoint_path(shard: int, slice_idx: int) -> str:
-    return os.path.join(CHECKPOINT_DIR, f"shard{shard}_slice{slice_idx}.pt")
+def checkpoint_path(shard: int, slice_idx: int, checkpoint_dir: str | None = None) -> str:
+    return os.path.join(checkpoint_dir or CHECKPOINT_DIR, f"shard{shard}_slice{slice_idx}.pt")
 
 
 def load_shard(shard: int) -> dict:
@@ -98,12 +98,22 @@ def fit_preprocessor(records: dict) -> ShardPreprocessor:
 
 
 def train_shard(shard: int, records: dict | None = None, from_slice: int = 0,
-                resume_state: dict | None = None, seed: int = SEED) -> dict:
+                resume_state: dict | None = None, seed: int = SEED,
+                checkpoint_dir: str | None = None) -> dict:
     """Train slices [from_slice, NUM_SLICES), checkpointing after each.
 
     Returns {slice_idx: state_dict_digest}. `from_slice > 0` requires
     `resume_state` -- the checkpoint taken after slice from_slice-1.
+
+    `checkpoint_dir` overrides where checkpoints land. The reproducibility
+    spot-check (worker/jobs.py) passes a temporary directory: it re-runs a
+    rebuild that already happened, and writing to the real paths would
+    overwrite the promoted checkpoint -- harmlessly with identical bytes when
+    the check passes, and with DIVERGENT weights exactly when it fails, which
+    is the moment you least want the next rebuild resuming from a file that
+    matches no recorded hash.
     """
+    out_dir = checkpoint_dir or CHECKPOINT_DIR
     enforce_determinism(seed)
     if records is None:
         records = load_shard(shard)
@@ -117,8 +127,8 @@ def train_shard(shard: int, records: dict | None = None, from_slice: int = 0,
     opt = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     loss_fn = nn.BCEWithLogitsLoss()
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    with open(os.path.join(CHECKPOINT_DIR, f"shard{shard}_preproc.json"), "w") as f:
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, f"shard{shard}_preproc.json"), "w") as f:
         f.write(preproc.to_json())
 
     digests = {}
@@ -139,7 +149,7 @@ def train_shard(shard: int, records: dict | None = None, from_slice: int = 0,
                 loss_fn(model(xb), yb).backward()
                 opt.step()
 
-        torch.save(model.state_dict(), checkpoint_path(shard, slice_idx))
+        torch.save(model.state_dict(), checkpoint_path(shard, slice_idx, out_dir))
         digests[slice_idx] = state_dict_digest(model.state_dict())
     return digests
 
