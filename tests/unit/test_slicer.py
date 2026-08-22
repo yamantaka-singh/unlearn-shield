@@ -29,3 +29,13 @@ def test_all_slices_used_and_in_range():
     ids, churn, counts = _subjects(600)
     slices = assign_slices(ids, churn, counts)
     assert set(np.unique(slices)) == {0, 1, 2, 3, 4}
+
+
+def test_empty_shard_returns_empty_not_a_crash():
+    """A real bug, found by a real-data smoke test with few subjects and more
+    shards than usual: hash-based shard assignment can leave a shard with zero
+    subjects, and every caller (engine.train.build) loops over every shard
+    unconditionally regardless of size."""
+    out = assign_slices(np.array([], dtype="<U8"), np.array([]), np.array([], dtype=np.int64))
+    assert out.shape == (0,)
+    assert out.dtype == np.int64

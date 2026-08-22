@@ -8,7 +8,7 @@ Remove a subject from a trained model and get back a signed certificate
 an auditor can verify — without access to your training system, your
 database, or your weights.
 
-[![tests](https://img.shields.io/badge/tests-218_passing-2ea043?style=flat-square)](#testing)
+[![tests](https://img.shields.io/badge/tests-225_passing-2ea043?style=flat-square)](#testing)
 [![p99](https://img.shields.io/badge/predict_p99-9.8ms-2ea043?style=flat-square)](#serving-latency)
 [![proof leak](https://img.shields.io/badge/subjects_leaked_per_proof-0-2ea043?style=flat-square)](#absence-proofs-that-name-nobody)
 [![python](https://img.shields.io/badge/python-3.11-3776ab?style=flat-square)](https://www.python.org)
@@ -63,7 +63,7 @@ spread is the entire point.
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements-dev.txt
 
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 170 tests, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q     # 177 tests, no database
 ```
 
 `PYTHONHASHSEED` must be set before the interpreter starts, so the determinism
@@ -152,6 +152,39 @@ re-running in the same worker pass needs nothing extra.
 `test_spot_check_detects_a_genuine_divergence` is the negative control, because
 a check that only ever passes proves nothing.
 → [ADR 0010](docs/adr/0010-hardening-findings.md)
+
+### Validated against real PaySim, not just the synthetic generator
+
+Every prior claim in this README was checked against `data/synth.py` — a
+generator this project controls the statistics of. Pulled the real, public
+dataset the plan named from the start (Kaggle needs a login this session
+doesn't have; a mirror on Hugging Face is MIT-licensed and ungated, confirmed
+genuine by file size and column layout) and ran 1.5M real rows through the
+actual pipeline.
+
+Two real bugs surfaced and are fixed: `engine/slicer.py` crashed on an empty
+shard (any small tenant or pilot deployment would have hit this — no existing
+test used few enough subjects to trigger it), and `engine/train.py::build()`'s
+hardcoded `max_step=720` silently disabled hot-shard concentration entirely on
+real data, whose actual step range doesn't match the synthetic default — every
+subject landed in a cold shard, no error, no warning.
+
+One apparent finding was retracted. Per-shard AUC first measured at 0.49–0.69
+against an unsharded 0.9989 on the same rows — a plausible, serious story
+("SISA can't detect fraud at real 0.1% prevalence"). It wasn't real: a
+validation script patched one module's copy of `SHARD_DIR` but not another's,
+so a booster trained on stale leftover data got scored against real data it
+never saw. Fixed the script, re-measured: **every shard hits AUC 0.998–0.9998**,
+matching the unsharded baseline, even with as few as 21 fraud examples in a
+shard. Real fraud prevalence does not meaningfully cost accuracy here.
+
+Real PaySim's subject cardinality is also strikingly different from the
+synthetic generator's invented multi-record distribution — 99.96% of subjects
+have exactly one transaction (max 3, at 1.5M rows). Subject-aligned slicing
+(ADR 0005) doesn't misbehave: it degrades gracefully to per-row granularity.
+The multi-record scenario it was built to fix just doesn't arise in PaySim's
+one-shot-transfer design; that needs a real customer ledger to confirm, not a
+simulator. → [ADR 0012](docs/adr/0012-real-paysim-validation.md)
 
 ### Trees, where rollback is just truncation
 
@@ -354,7 +387,7 @@ connectors, ONNX and Rust inference.
 ## Testing
 
 ```bash
-PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 170, no database
+PYTHONHASHSEED=0 .venv/bin/python -m pytest tests/unit -q                    # 177, no database
 
 docker compose up -d postgres
 DATABASE_URL=postgresql://unlearnshield:unlearnshield@localhost:55432/unlearnshield \
@@ -379,6 +412,7 @@ suite runs wherever a database exists.
 | `test_eval_set` | Hand-rolled AUC vs. brute-force pairwise count, degenerate classes |
 | `test_eval_results` | A promotion's AUC matches an independent recomputation |
 | `test_dashboard` | Console API; live certificate re-verification; read-only role refuses writes |
+| `test_prepare` | Real-PaySim ingest against a schema-accurate fixture; type-drift guard |
 | `test_gbdt` | Truncation is exact; rebuild is byte-identical to a clean retrain; real certificate verifies |
 | `test_spot_check` | Re-runs a real rebuild; detects a forced divergence; leaves checkpoints untouched |
 | `test_idempotency` | Replay dedupe, and that one principal's key never returns another's job |

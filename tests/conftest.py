@@ -17,6 +17,32 @@ def _signing_key():
     os.environ.setdefault("UNLEARNSHIELD_SIGNING_KEY", bytes(SigningKey.generate()).hex())
 
 
+def override_shard_dir(monkeypatch, shard_dir: str) -> None:
+    """Every module that does `from config.settings import SHARD_DIR` gets its
+    own frozen copy at import time -- patching `config.settings.SHARD_DIR`
+    alone changes nothing for a module that already imported the name.
+    `monkeypatch.setattr(engine.train, "SHARD_DIR", ...)` alone silently misses
+    the other four; a fixture built that way trains or reads real data from
+    whatever is left over in the last-used directory, with no error, on
+    whichever module the author forgot.
+
+    This has caused three separate real confusions in one session of manual
+    validation work: an empty-shard crash whose repro only patched
+    engine.train, a "348 rows" false alarm two shells later, and a booster
+    silently trained against stale demo data while being scored against real
+    PaySim -- because `gbdt.build()`'s internal `load_shard()` reads
+    engine.train's copy of SHARD_DIR, not engine.gbdt's, and only the latter
+    had been patched. All three were caught, none were fast to find. This
+    helper exists so nobody has to rediscover the module list by trial and
+    error again -- keep it in sync with `grep -rn "SHARD_DIR" --include=*.py`.
+    """
+    import engine.gbdt as gbdt_mod
+    import engine.rebuild as rebuild_mod
+    import engine.train as train_mod
+    for mod in (train_mod, gbdt_mod, rebuild_mod):
+        monkeypatch.setattr(mod, "SHARD_DIR", shard_dir)
+
+
 # Every table, so a case never inherits another's rows. eval_results was
 # already being cleared by CASCADE through its model_versions foreign key;
 # disagreement_reviews has no FK, so it genuinely leaked rows between tests

@@ -38,6 +38,17 @@ def assign_slices(subject_ids: np.ndarray, churn: np.ndarray, record_counts: np.
     if num_slices < 1:
         raise ValueError(f"num_slices must be >= 1, got {num_slices}")
 
+    # An empty shard is real, not hypothetical: hash-based shard assignment
+    # (engine/sharder.py) can leave a shard with zero subjects whenever subject
+    # count is small relative to shard count -- a new tenant's first few
+    # customers, a staging smoke test, a per-tenant subset. Every existing
+    # caller loops over every shard unconditionally (engine/train.py::build),
+    # so this has to return cleanly rather than let np.cumsum(empty)[-1] raise
+    # an IndexError three frames from where the actual problem is a subject
+    # count, not a slicing bug.
+    if len(subject_ids) == 0:
+        return np.empty(0, dtype=np.int64)
+
     # Ties broken by subject_id so the ordering is total, not merely sorted.
     order = np.lexsort((subject_ids, churn))
     cumulative = np.cumsum(record_counts[order])

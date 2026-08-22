@@ -5,6 +5,7 @@ because tree rollback is truncation rather than a checkpoint reload.
 """
 
 import json
+import os
 
 import numpy as np
 import pytest
@@ -266,3 +267,39 @@ def test_config_digest_changes_when_trees_per_slice_changes(monkeypatch):
     before = gbdt.config_digest()
     monkeypatch.setattr(gbdt, "TREES_PER_SLICE", gbdt.TREES_PER_SLICE + 1)
     assert gbdt.config_digest() != before
+
+
+def test_override_shard_dir_helper_patches_every_module_consistently(tmp_path, monkeypatch):
+    """Regression guard for the exact bug this session's real-data validation
+    found: engine.gbdt.load_shard is engine.train's function object, so it
+    ALWAYS resolves SHARD_DIR through engine.train's globals regardless of who
+    calls it -- but engine.gbdt.save_booster and booster_path are DEFINED in
+    engine/gbdt.py, so THEY resolve through engine.gbdt's own SHARD_DIR. One
+    gbdt.build() call therefore reads through one module's binding and writes
+    through another's. Patch only one and the read/write halves silently
+    diverge: a booster trains on the data at one location and is filed at
+    another, with no error -- which is exactly what happened when validating
+    against real PaySim data (gbdt.SHARD_DIR was set, engine.train's was not).
+
+    Checked structurally (are the bindings the same directory?) rather than
+    behaviourally (does accuracy look right?) -- an accuracy-based check
+    turned out to depend on which half of the read/write split was patched
+    and could pass even with a real divergence, discovered while writing this
+    test.
+    """
+    import engine.gbdt as gbdt_mod
+    import engine.rebuild as rebuild_mod
+    from tests.conftest import override_shard_dir
+
+    override_shard_dir(monkeypatch, str(tmp_path / "shards"))
+    assert train_mod.SHARD_DIR == gbdt_mod.SHARD_DIR == rebuild_mod.SHARD_DIR == str(tmp_path / "shards")
+
+    routing = train_mod.build(n_subjects=30, seed=71)
+    gbdt.build(routing)
+
+    for shard in {e["shard"] for e in routing.values()}:
+        # The booster must have been written under tmp_path, not the default
+        # data/shards/ -- that is the concrete, checkable form of "read and
+        # write agreed on where the data lives".
+        assert gbdt.booster_path(shard).startswith(str(tmp_path))
+        assert os.path.exists(gbdt.booster_path(shard))

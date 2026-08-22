@@ -47,14 +47,35 @@ def save_shard(shard: int, records: dict) -> None:
     np.savez(shard_path(shard), **records)
 
 
-def build(n_subjects: int = 800, seed: int = SEED, max_step: int = 720) -> dict:
+def build(n_subjects: int = 800, seed: int = SEED, max_step: int | None = None,
+         raw: dict | None = None) -> dict:
     """Partition raw records into shard files plus a routing table.
 
     Runs once. Shard and slice assignment are frozen afterwards: recomputing
     churn later and letting the routing follow it would invalidate the rollback
     point of every checkpoint already on disk.
+
+    `raw` overrides the synthetic generator with a pre-loaded records dict of
+    the same schema (data.prepare.load's real-PaySim output, for instance).
+    Everything past this point is schema-generic; only the row source changes.
+
+    `max_step=None` (the default) derives the simulation horizon from whichever
+    data is actually in play: 720 for the synthetic generator, `raw["step"].max()`
+    for real data. Leaving that to a hardcoded 720 regardless of `raw` was a
+    real bug, found by running real PaySim through this exact path:
+    churn_score.py computes `recency = last_step / max_step`, and a real
+    subsample rarely spans the full simulation -- 150k real rows span steps
+    1-153, not 1-720. Recency then tops out around 0.21, which combined with
+    the noise term can never reach HOT_THRESHOLD (0.6), so every subject lands
+    in a cold shard and the entire hot/cold concentration this sharding scheme
+    exists for produces nothing -- silently, no error, no warning. Pass
+    `max_step` explicitly only to override the derived horizon.
     """
-    raw = generate(n_subjects=n_subjects, seed=seed, max_step=max_step)
+    if raw is None:
+        raw = generate(n_subjects=n_subjects, seed=seed, max_step=max_step or 720)
+        max_step = max_step or 720
+    elif max_step is None:
+        max_step = float(raw["step"].max())
     subjects, inverse = np.unique(raw["nameOrig"], return_inverse=True)
     counts = np.bincount(inverse)
 
