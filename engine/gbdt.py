@@ -39,10 +39,10 @@ import xgboost as xgb
 from config.determinism import enforce_determinism
 from config.settings import CODE_DIGEST, NUM_SHARDS, NUM_SLICES, SEED, SHARD_DIR, subject_ref
 from data.synth import NUMERIC_COLUMNS, TYPES
-from engine.train import load_routing, load_shard, save_shard
+from engine.train import load_routing, load_shard, save_routing, save_shard
 from verify import manifest as manifest_mod
 from verify.sign import sign_manifest
-from verify.smt import build_root, prove_absence
+from verify.smt import SparseMerkleTree
 
 TREES_PER_SLICE = int(os.environ.get("GBDT_TREES_PER_SLICE", "20"))
 
@@ -248,14 +248,17 @@ def rebuild_batch_by_ref(refs: list, trees_per_slice: int = TREES_PER_SLICE,
     # path: the proof has to be about the data that actually trained the
     # model, not the set as it stood when the request arrived.
     retained_refs = set(retained["subject_ref"].tolist())
-    dataset_root = build_root(retained_refs)
+    # One tree for the root and every proof in this batch -- see
+    # engine/rebuild.py for the measurement that motivated it.
+    tree = SparseMerkleTree(retained_refs)
+    dataset_root = tree.root
     cfg_digest = config_digest()
 
     manifests = {}
     for ref in refs:
         m = manifest_mod.build(
             subject_ref=ref, shard=shard, resumed_from=resumed_from,
-            dataset_root=dataset_root, absence_proof=prove_absence(ref, retained_refs),
+            dataset_root=dataset_root, absence_proof=tree.prove_absence(ref),
             code_digest=CODE_DIGEST, config_digest=cfg_digest,
             result_weights=result_weights,
             model_version=f"gbdt-shard{shard}-{result_weights[:12]}",
@@ -267,8 +270,7 @@ def rebuild_batch_by_ref(refs: list, trees_per_slice: int = TREES_PER_SLICE,
 
     for ref in refs:
         routing.pop(ref)
-    with open(os.path.join(SHARD_DIR, "routing.json"), "w") as f:
-        json.dump(routing, f, sort_keys=True, indent=1)
+    save_routing(routing)
 
     return {
         "shard": shard,

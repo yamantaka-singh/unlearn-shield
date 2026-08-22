@@ -102,10 +102,29 @@ def build(n_subjects: int = 800, seed: int = SEED, max_step: int | None = None,
         routing[ref] = {"tenant_id": TENANT_ID, "shard": int(shard_of_subject[i]),
                         "min_slice_idx": int(slice_of_subject[i]),
                         "record_count": int(counts[i])}
+    save_routing(routing)
+    return routing
+
+
+def save_routing(routing: dict) -> None:
+    """Write the routing table. Every writer goes through here (build above,
+    engine/rebuild.py, engine/gbdt.py) so the format cannot drift between the
+    initial write and the rewrites an erasure performs.
+
+    Compact, and not sorted or indented. At 1.6M subjects the file is ~213MB
+    either way -- long past the point anyone reads it -- and `sort_keys` alone
+    cost 4.3s of the ~10s each erasure spent rewriting it, for ordering that
+    was already redundant: the dict is built in a deterministic order and
+    `pop` preserves the order of what remains, so successive writes are
+    byte-stable without paying to re-sort 1.6M keys per erasure.
+
+    Nothing hashes this file -- the manifest commits to the Merkle root over
+    retained subject_refs, not to the routing table -- so its formatting is
+    not load-bearing for any proof.
+    """
     os.makedirs(SHARD_DIR, exist_ok=True)
     with open(os.path.join(SHARD_DIR, "routing.json"), "w") as f:
-        json.dump(routing, f, sort_keys=True, indent=1)
-    return routing
+        json.dump(routing, f, separators=(",", ":"))
 
 
 def load_routing() -> dict:

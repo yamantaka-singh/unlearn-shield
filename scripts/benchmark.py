@@ -61,7 +61,8 @@ def _metrics(y_true, y_score) -> dict:
     }
 
 
-def run(csv_path: str, rows: int, train_fraction: float, seed: int) -> dict:
+def run(csv_path: str, rows: int, train_fraction: float, seed: int,
+        with_mlp: bool = False) -> dict:
     import numpy as np
     import xgboost as xgb
 
@@ -125,6 +126,28 @@ def run(csv_path: str, rows: int, train_fraction: float, seed: int) -> dict:
         "ensemble": _metrics(y_test, np.mean(shard_scores, axis=0)),
         "per_shard": per_shard,
     }
+
+    # --- MLP SISA ensemble, for the engine comparison -----------------------
+    # Off by default (--with-mlp). Not laziness: the MLP trains with
+    # EPOCHS_PER_SLICE passes over cumulative slices at batch 256, so on 1.6M
+    # rows it is minutes per shard against seconds for the whole GBDT run.
+    # Enabling it at 2M rows turns a 2-minute benchmark into a ~40-minute one,
+    # which is a different kind of job -- so it is opt-in and best run at a
+    # smaller --rows.
+    if with_mlp:
+        from inference.batched_ensemble import load_ensemble
+        t0 = time.perf_counter()
+        for shard in shards:
+            train_mod.train_shard(shard)
+        mlp_seconds = time.perf_counter() - t0
+
+        ckpt = os.environ["CHECKPOINT_DIR"]
+        ensemble = load_ensemble(
+            {str(k): train_mod.checkpoint_path(k, NUM_SLICES - 1) for k in shards},
+            {str(k): os.path.join(ckpt, f"shard{k}_preproc.json") for k in shards})
+        mlp_scores = ensemble.predict_proba(test_raw, test_rows)
+        result["mlp_sisa"] = {"train_seconds": mlp_seconds,
+                              "ensemble": _metrics(y_test, mlp_scores)}
 
     # --- Unsharded baseline: one booster, same rows, same total rounds ------
     # Matched deliberately. A baseline trained for a different number of
@@ -246,13 +269,15 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=400_000, help="0 for all")
     parser.add_argument("--train-fraction", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--with-mlp", action="store_true",
+                        help="also train and score the MLP SISA ensemble (slow)")
     parser.add_argument("--out", default="benchmark.json")
     args = parser.parse_args()
 
     scratch = tempfile.mkdtemp(prefix="unlearnshield-bench-")
     try:
         _configure(scratch)
-        result = run(args.csv, args.rows, args.train_fraction, args.seed)
+        result = run(args.csv, args.rows, args.train_fraction, args.seed, args.with_mlp)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -265,7 +290,10 @@ def main() -> int:
     print(f"{d['rows_train']:,} train / {d['rows_test']:,} test rows, "
           f"{d['fraud_test']} fraud held out ({d['prevalence_test']*100:.3f}%)")
     print(f"{'':22} {'ROC-AUC':>9} {'AP':>9} {'P@R=0.80':>9}")
-    for name, m in (("SISA ensemble", s), ("unsharded baseline", u)):
+    rows_out = [("GBDT SISA ensemble", s), ("GBDT unsharded", u)]
+    if "mlp_sisa" in result:
+        rows_out.append(("MLP SISA ensemble", result["mlp_sisa"]["ensemble"]))
+    for name, m in rows_out:
         print(f"{name:22} {m['roc_auc']:9.4f} {m['average_precision']:9.4f} "
               f"{m['precision_at_recall_80']['precision']:9.4f}")
     print(f"erasure retrain by rollback point (from-scratch = "

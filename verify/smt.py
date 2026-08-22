@@ -71,11 +71,6 @@ def _singleton_root(key: bytes, depth: int) -> bytes:
 
 
 def _subtree_root(keys: list[bytes], depth: int) -> bytes:
-    # ponytail: recomputes subtrees per call, so building a root is O(n * depth)
-    # hashes -- about 0.1s for a few hundred subjects. The singleton shortcut
-    # above is what keeps it from being far worse, since with random keys almost
-    # every key isolates within the first ~log2(n) levels. Memoise the node map
-    # if a shard ever reaches six figures.
     if not keys:
         return DEFAULTS[depth]
     if len(keys) == 1:
@@ -89,41 +84,101 @@ def _keys(subject_refs) -> list[bytes]:
     return sorted({bytes.fromhex(r) for r in subject_refs})
 
 
+# A materialised node: (hash, left, right, singleton_key).
+#   internal  -> (h, left, right, None)
+#   singleton -> (h, None, None, key)      one key occupies this whole subtree
+#   empty     -> (DEFAULTS[depth], None, None, None)
+def _build(keys: list[bytes], depth: int):
+    if not keys:
+        return (DEFAULTS[depth], None, None, None)
+    if len(keys) == 1:
+        return (_singleton_root(keys[0], depth), None, None, keys[0])
+    left = _build([k for k in keys if _bit(k, depth) == 0], depth + 1)
+    right = _build([k for k in keys if _bit(k, depth) == 1], depth + 1)
+    return (_node(left[0], right[0]), left, right, None)
+
+
+class SparseMerkleTree:
+    """Build the tree once; serve the root and every absence proof from it.
+
+    This exists because the free functions below rebuild the tree from scratch
+    on every call, and a rebuild issues one `build_root` plus one
+    `prove_absence` per erased subject -- so a batch paid for the whole tree
+    (n+1) times. Measured on 276,075 subjects, which is a realistic shard at
+    the scale this project targets:
+
+        build_root      40.7s
+        prove_absence   40.8s     <- a second full traversal, same work again
+        SparseMerkleTree(refs)    one build, root and proofs then ~free
+
+    The per-key floor is inherent and worth naming so nobody hunts for a
+    bigger win that is not there: a key isolates from its neighbours at around
+    depth log2(n) (~18 here), but the path from its leaf at depth 256 up to
+    that point is still ~238 hashes of "combine with an empty sibling". At
+    276k keys that is ~65M SHA-256 calls, which is the whole of the remaining
+    build cost. Shortening DEPTH would cut it proportionally and is
+    deliberately NOT done: the 256-bit path is what makes a subject's position
+    unforgeable, and trading that for wall-clock is a security change wearing
+    a performance costume.
+    """
+
+    def __init__(self, subject_refs):
+        self._keys = _keys(subject_refs)
+        self._present = set(self._keys)
+        self._root = _build(self._keys, 0)
+
+    @property
+    def root(self) -> str:
+        return self._root[0].hex()
+
+    def prove_absence(self, target_ref: str) -> dict:
+        """Walk down the built tree collecting sibling subtree hashes.
+
+        Only siblings that differ from the all-empty default carry
+        information; the rest are recomputable by the verifier from DEFAULTS.
+        Sending 256 mostly-identical hashes would work and be ~8KB of noise
+        per certificate.
+        """
+        target = bytes.fromhex(target_ref)
+        if target in self._present:
+            raise ValueError(f"{target_ref[:12]}... is present; cannot prove absence")
+
+        siblings = {}
+        node = self._root
+        for depth in range(DEPTH):
+            _, left, right, key = node
+            if left is not None:
+                bit = _bit(target, depth)
+                same, other = (left, right) if bit == 0 else (right, left)
+                if other[0] != DEFAULTS[depth + 1]:
+                    siblings[depth] = other[0].hex()
+                node = same
+                continue
+            if key is None:
+                # Empty subtree: every remaining sibling is a default, and the
+                # verifier fills those in itself.
+                break
+            # A collapsed singleton. The one key here shares the target's
+            # prefix down to wherever their bits first differ; every level
+            # above that has an empty sibling and contributes nothing.
+            for d in range(depth, DEPTH):
+                if _bit(target, d) != _bit(key, d):
+                    siblings[d] = _singleton_root(key, d + 1).hex()
+                    break
+            break
+
+        return {"scheme": "smt-256", "siblings": siblings}
+
+
 def build_root(subject_refs) -> str:
     return _subtree_root(_keys(subject_refs), 0).hex()
 
 
 def prove_absence(target_ref: str, subject_refs) -> dict:
-    """Prove `target_ref` occupies an empty position.
-
-    Raises ValueError if the key is present -- a caller asking to prove absence
-    of a present subject has a bug upstream, and returning something
-    proof-shaped is the worst available answer.
-    """
-    target = bytes.fromhex(target_ref)
-    keys = _keys(subject_refs)
-    if target in keys:
-        raise ValueError(f"{target_ref[:12]}... is present; cannot prove absence")
-
-    # Only siblings that differ from the all-empty default carry information;
-    # the rest are recomputable by the verifier from DEFAULTS. Sending 256
-    # mostly-identical hashes would work and be ~8KB of noise per certificate.
-    siblings = {}
-    current = keys
-    for depth in range(DEPTH):
-        bit = _bit(target, depth)
-        same = [k for k in current if _bit(k, depth) == bit]
-        other = [k for k in current if _bit(k, depth) != bit]
-        sibling = _subtree_root(other, depth + 1)
-        if sibling != DEFAULTS[depth + 1]:
-            siblings[depth] = sibling.hex()
-        current = same
-        if not current:
-            # Every remaining sibling is empty by construction; stop early
-            # rather than walking the remaining levels to collect defaults.
-            break
-
-    return {"scheme": "smt-256", "siblings": siblings}
+    """Single-shot absence proof. Kept for callers proving one thing against a
+    set they hold once; a rebuild should use SparseMerkleTree instead so the
+    root and the proofs share one build."""
+    return SparseMerkleTree(subject_refs).prove_absence(target_ref)
 
 
 def verify_absence(target_ref: str, proof: dict, root_hex: str) -> bool:

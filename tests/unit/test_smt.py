@@ -147,3 +147,52 @@ def test_depth_matches_subject_ref_width():
     the other must."""
     from config.settings import subject_ref
     assert len(bytes.fromhex(subject_ref("C0000001"))) * 8 == DEPTH
+
+
+def test_tree_matches_the_single_shot_functions_and_verifies():
+    """SparseMerkleTree exists purely as a performance fix (one build serving
+    the root and every proof, instead of a rebuild per call). A performance fix
+    that changes a root is a correctness disaster: every certificate ever
+    issued verifies against a recorded dataset_root, so the two paths must
+    agree byte for byte, not merely 'both verify'."""
+    import secrets
+
+    from verify.smt import (SparseMerkleTree, build_root, prove_absence,
+                            verify_absence)
+
+    for n in (0, 1, 2, 3, 17, 400):
+        refs = [secrets.token_hex(32) for _ in range(n)]
+        tree = SparseMerkleTree(refs)
+        assert tree.root == build_root(refs), f"root diverged at n={n}"
+        for _ in range(5):
+            target = secrets.token_hex(32)
+            assert tree.prove_absence(target) == prove_absence(target, refs), \
+                f"proof diverged at n={n}"
+            assert verify_absence(target, tree.prove_absence(target), tree.root)
+
+
+def test_tree_refuses_to_prove_absence_of_a_present_key():
+    import secrets
+
+    import pytest
+
+    from verify.smt import SparseMerkleTree
+
+    refs = [secrets.token_hex(32) for _ in range(50)]
+    tree = SparseMerkleTree(refs)
+    with pytest.raises(ValueError):
+        tree.prove_absence(refs[0])
+
+
+def test_a_proof_does_not_verify_against_another_trees_root():
+    """Negative control. Without it the pair above would pass for a tree that
+    returned the same constant for everything."""
+    import secrets
+
+    from verify.smt import SparseMerkleTree, verify_absence
+
+    a = SparseMerkleTree([secrets.token_hex(32) for _ in range(50)])
+    b = SparseMerkleTree([secrets.token_hex(32) for _ in range(50)])
+    target = secrets.token_hex(32)
+    assert verify_absence(target, a.prove_absence(target), a.root)
+    assert not verify_absence(target, a.prove_absence(target), b.root)

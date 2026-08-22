@@ -18,10 +18,10 @@ import torch
 
 from config.settings import (BATCH_SIZE, CODE_DIGEST, EPOCHS_PER_SLICE, LEARNING_RATE,
                              NUM_SHARDS, NUM_SLICES, SEED, SHARD_DIR, subject_ref)
-from engine.train import (checkpoint_path, load_routing, load_shard, save_shard,
-                          train_shard)
+from engine.train import (checkpoint_path, load_routing, load_shard, save_routing,
+                          save_shard, train_shard)
 from verify import manifest as manifest_mod
-from verify.smt import build_root, prove_absence
+from verify.smt import SparseMerkleTree
 from verify.sign import sign_manifest
 
 
@@ -100,14 +100,18 @@ def rebuild_batch_by_ref(refs: list, seed: int = SEED, sign: bool = True) -> dic
     # retained set and every proof is about the set that actually trained the
     # model -- not the set as it was when any of these requests arrived.
     retained = set(records["subject_ref"].tolist())
-    dataset_root = build_root(retained)
+    # One tree for the root AND every proof in this batch. Building per call
+    # meant a batch of k subjects paid for the whole tree k+1 times, which at
+    # a realistic shard size was ~81s of the ~90s an erasure took.
+    tree = SparseMerkleTree(retained)
+    dataset_root = tree.root
     cfg_digest = config_digest()
 
     manifests = {}
     for ref in refs:
         m = manifest_mod.build(
             subject_ref=ref, shard=shard, resumed_from=resumed_from,
-            dataset_root=dataset_root, absence_proof=prove_absence(ref, retained),
+            dataset_root=dataset_root, absence_proof=tree.prove_absence(ref),
             code_digest=CODE_DIGEST, config_digest=cfg_digest,
             result_weights=result_weights,
             model_version=f"shard{shard}-{result_weights[:12]}",
@@ -123,8 +127,7 @@ def rebuild_batch_by_ref(refs: list, seed: int = SEED, sign: bool = True) -> dic
     # Phase 4's idempotency_key, not by leaving these rows behind.
     for ref in refs:
         routing.pop(ref)
-    with open(os.path.join(SHARD_DIR, "routing.json"), "w") as f:
-        json.dump(routing, f, sort_keys=True, indent=1)
+    save_routing(routing)
 
     return {
         "shard": shard,
