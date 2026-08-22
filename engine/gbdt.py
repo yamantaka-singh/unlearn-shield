@@ -42,7 +42,7 @@ from data.synth import NUMERIC_COLUMNS, TYPES
 from engine.train import load_routing, load_shard, save_routing, save_shard
 from verify import manifest as manifest_mod
 from verify.sign import sign_manifest
-from verify.smt import SparseMerkleTree
+from verify import smt
 
 TREES_PER_SLICE = int(os.environ.get("GBDT_TREES_PER_SLICE", "20"))
 
@@ -228,6 +228,10 @@ def rebuild_batch_by_ref(refs: list, trees_per_slice: int = TREES_PER_SLICE,
     min_slice = min(e["min_slice_idx"] for e in entries)
 
     records = load_shard(shard)
+    # Captured before rebuild_booster purges: this describes what is actually
+    # on disk right now, which is what the tree cache is validated against.
+    tree_before = smt.tree_for_shard(shard, records["subject_ref"])
+
     booster = load_booster(shard)
     rebuilt, retained = rebuild_booster(shard, refs, records, min_slice, booster,
                                        trees_per_slice=trees_per_slice)
@@ -247,10 +251,11 @@ def rebuild_batch_by_ref(refs: list, trees_per_slice: int = TREES_PER_SLICE,
     # Built from the retained set AFTER the purge, same reasoning as the MLP
     # path: the proof has to be about the data that actually trained the
     # model, not the set as it stood when the request arrived.
-    retained_refs = set(retained["subject_ref"].tolist())
-    # One tree for the root and every proof in this batch -- see
-    # engine/rebuild.py for the measurement that motivated it.
-    tree = SparseMerkleTree(retained_refs)
+    # Removes exactly the purged refs from the pre-purge tree instead of
+    # rebuilding from the retained set -- see engine/rebuild.py's copy of this
+    # comment for the measurement.
+    tree = tree_before.remove(refs)
+    smt.cache_tree(shard, tree)
     dataset_root = tree.root
     cfg_digest = config_digest()
 

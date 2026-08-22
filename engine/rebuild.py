@@ -21,7 +21,7 @@ from config.settings import (BATCH_SIZE, CODE_DIGEST, EPOCHS_PER_SLICE, LEARNING
 from engine.train import (checkpoint_path, load_routing, load_shard, save_routing,
                           save_shard, train_shard)
 from verify import manifest as manifest_mod
-from verify.smt import SparseMerkleTree
+from verify import smt
 from verify.sign import sign_manifest
 
 
@@ -75,6 +75,11 @@ def rebuild_batch_by_ref(refs: list, seed: int = SEED, sign: bool = True) -> dic
     min_slice = min(e["min_slice_idx"] for e in entries)
 
     records = load_shard(shard)
+    # Captured before the purge below mutates `records`: this is what the tree
+    # cache is validated against, since it describes what is ACTUALLY on disk
+    # right now, independent of anything this call is about to do.
+    tree_before = smt.tree_for_shard(shard, records["subject_ref"])
+
     dropped_total = 0
     for ref in refs:
         records, dropped = purge(records, ref)
@@ -96,14 +101,12 @@ def rebuild_batch_by_ref(refs: list, seed: int = SEED, sign: bool = True) -> dic
     resumed_from = f"slice{min_slice - 1}" if min_slice > 0 else "fresh_init"
     completed_at = datetime.now(timezone.utc).isoformat()
 
-    # Built from the shard file AFTER the purge, so the root commits to the
-    # retained set and every proof is about the set that actually trained the
-    # model -- not the set as it was when any of these requests arrived.
-    retained = set(records["subject_ref"].tolist())
-    # One tree for the root AND every proof in this batch. Building per call
-    # meant a batch of k subjects paid for the whole tree k+1 times, which at
-    # a realistic shard size was ~81s of the ~90s an erasure took.
-    tree = SparseMerkleTree(retained)
+    # Removes exactly the purged refs from the pre-purge tree rather than
+    # rebuilding over the retained set from scratch -- O(len(refs) * DEPTH)
+    # instead of O(n * DEPTH). Root commits to the retained set either way, so
+    # every proof is still about the set that actually trained the model.
+    tree = tree_before.remove(refs)
+    smt.cache_tree(shard, tree)
     dataset_root = tree.root
     cfg_digest = config_digest()
 

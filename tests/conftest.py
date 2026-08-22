@@ -88,6 +88,7 @@ def pg():
     """
     from db.conn import connect, reset_pool
     from inference.batched_ensemble import clear_cache
+    from verify.smt import clear_tree_cache
     try:
         conn = connect()
     except Exception as exc:
@@ -100,9 +101,16 @@ def pg():
     # tmp_paths that can produce identical weights -- so a key can legitimately
     # repeat while pointing at files that no longer exist.
     clear_cache()
+    # The Merkle tree cache (verify/smt.py) is keyed on shard NUMBER, not on
+    # anything path- or tmp_path-specific -- a test using shard 3 always hits
+    # the same dict entry a previous test using shard 3 left behind. The
+    # fingerprint check would catch a mismatch, but clearing here means a test
+    # never passes BECAUSE that safety net caught something.
+    clear_tree_cache()
     with conn, conn.cursor() as cur:
         cur.execute(f"TRUNCATE {', '.join(TABLES)} RESTART IDENTITY CASCADE")
     yield conn
     conn.close()
     reset_pool()
     clear_cache()
+    clear_tree_cache()

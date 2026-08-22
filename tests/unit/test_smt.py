@@ -196,3 +196,167 @@ def test_a_proof_does_not_verify_against_another_trees_root():
     target = secrets.token_hex(32)
     assert verify_absence(target, a.prove_absence(target), a.root)
     assert not verify_absence(target, a.prove_absence(target), b.root)
+
+
+def test_remove_matches_a_fresh_build_over_the_remaining_keys():
+    """The whole safety requirement for incremental removal: it must produce
+    the identical root and proofs a from-scratch build over the survivors
+    would, not merely 'a plausible-looking' one -- a manifest signs whatever
+    root this returns."""
+    import secrets
+
+    from verify.smt import SparseMerkleTree, build_root, prove_absence
+
+    for n, remove_n in ((1, 1), (2, 1), (5, 2), (200, 1), (200, 50), (200, 199)):
+        population = [secrets.token_hex(32) for _ in range(n)]
+        tree = SparseMerkleTree(population)
+        removed = population[:remove_n]
+        survivors = population[remove_n:]
+
+        after = tree.remove(removed)
+        assert after.root == build_root(survivors), f"n={n} remove_n={remove_n}"
+
+        for _ in range(5):
+            probe = secrets.token_hex(32)
+            assert after.prove_absence(probe) == prove_absence(probe, survivors)
+        for gone in removed:
+            assert after.prove_absence(gone) == prove_absence(gone, survivors)
+
+
+def test_repeated_removal_rounds_match_a_fresh_build_each_time():
+    """Simulates the real usage pattern: many separate erasure rounds against
+    the same shard, each removing a few keys from whatever remains. Catches
+    any bug in the recursive removal walker that a single-round test, however
+    many sizes it tries, would not -- e.g. incorrect handling of a subtree
+    that collapses to a singleton and is then removed again later."""
+    import secrets
+
+    from verify.smt import SparseMerkleTree, build_root
+
+    population = [secrets.token_hex(32) for _ in range(300)]
+    tree = SparseMerkleTree(population)
+    remaining = list(population)
+    rng = secrets.SystemRandom()
+
+    for _ in range(15):
+        if len(remaining) <= 1:
+            break
+        batch = rng.sample(remaining, k=min(5, len(remaining) - 1))
+        tree = tree.remove(batch)
+        remaining = [k for k in remaining if k not in set(batch)]
+        assert tree.root == build_root(remaining)
+
+
+def test_remove_raises_on_a_key_that_is_not_present():
+    import secrets
+
+    from verify.smt import SparseMerkleTree
+
+    population = [secrets.token_hex(32) for _ in range(50)]
+    tree = SparseMerkleTree(population)
+    stranger = secrets.token_hex(32)
+    with pytest.raises(ValueError):
+        tree.remove([stranger])
+
+
+def test_remove_of_all_but_present_keys_raises_before_mutating_anything():
+    """One bad ref in a batch must not partially apply -- a caller retries the
+    whole batch on failure, and a tree that already dropped some of the valid
+    refs would silently double-process them next time (or, worse, keep
+    serving a tree that matches neither the old nor the new state)."""
+    import secrets
+
+    from verify.smt import SparseMerkleTree
+
+    population = [secrets.token_hex(32) for _ in range(10)]
+    tree = SparseMerkleTree(population)
+    stranger = secrets.token_hex(32)
+    before_root = tree.root
+
+    with pytest.raises(ValueError):
+        tree.remove([population[0], stranger])
+    assert tree.root == before_root, "a failed remove() must not mutate the tree in place"
+
+
+def test_fingerprint_is_order_independent_and_set_sensitive():
+    import secrets
+
+    from verify.smt import fingerprint_of
+
+    population = [secrets.token_hex(32) for _ in range(50)]
+    shuffled = list(reversed(population))
+    assert fingerprint_of(population) == fingerprint_of(shuffled)
+
+    changed = population[:-1] + [secrets.token_hex(32)]
+    assert fingerprint_of(population) != fingerprint_of(changed)
+
+
+def test_tree_for_shard_reuses_a_cache_hit_without_rebuilding():
+    """The mechanism, not just the math: proves the expensive full-build path
+    is actually SKIPPED on a cache hit, by counting calls to the function that
+    does the expensive work -- a test that only checked the resulting root
+    could pass even if caching silently never engaged (a fresh build gives
+    the same root as a reused one, by construction)."""
+    import secrets
+
+    import verify.smt as smt_mod
+    from verify.smt import cache_tree, clear_tree_cache, tree_for_shard
+
+    clear_tree_cache()
+    population = [secrets.token_hex(32) for _ in range(80)]
+    calls = {"n": 0}
+    real_build = smt_mod._build
+
+    def counting_build(keys, depth):
+        calls["n"] += 1
+        return real_build(keys, depth)
+
+    smt_mod._build = counting_build
+    try:
+        tree = tree_for_shard(999001, population)
+        # _build recurses, so a real build calls it many times (once per node
+        # visited), not once -- the assertion that matters is that a MISS does
+        # real work at all, and a HIT (below) does none.
+        assert calls["n"] > 0, "first call for a shard must do a real build"
+        cache_tree(999001, tree)
+
+        calls["n"] = 0
+        again = tree_for_shard(999001, population)
+        assert calls["n"] == 0, "a fingerprint-matching cache hit must not call _build at all"
+        assert again is tree
+    finally:
+        smt_mod._build = real_build
+        clear_tree_cache()
+
+
+def test_tree_for_shard_falls_back_to_a_fresh_build_on_a_mismatch():
+    """The safety net: a cache entry that no longer matches reality (a
+    different worker rebuilt this shard, a restart lost in-memory state,
+    whatever the cause) must be silently DISCARDED, not trusted. Falling back
+    to a full build is the only acceptable behaviour here -- reusing a stale
+    tree would let a certificate commit to a root that does not describe what
+    is actually on disk."""
+    import secrets
+
+    from verify.smt import SparseMerkleTree, cache_tree, clear_tree_cache, tree_for_shard
+
+    clear_tree_cache()
+    stale_population = [secrets.token_hex(32) for _ in range(30)]
+    cache_tree(999002, SparseMerkleTree(stale_population))
+
+    actual_population = [secrets.token_hex(32) for _ in range(30)]  # unrelated keys
+    tree = tree_for_shard(999002, actual_population)
+    assert tree.fingerprint == SparseMerkleTree(actual_population).fingerprint
+    clear_tree_cache()
+
+
+def test_tree_for_shard_with_empty_cache_builds_fresh():
+    import secrets
+
+    from verify.smt import clear_tree_cache, tree_for_shard
+
+    clear_tree_cache()
+    population = [secrets.token_hex(32) for _ in range(10)]
+    tree = tree_for_shard(999003, population)
+    assert tree.fingerprint is not None
+    clear_tree_cache()

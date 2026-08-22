@@ -84,6 +84,21 @@ def _keys(subject_refs) -> list[bytes]:
     return sorted({bytes.fromhex(r) for r in subject_refs})
 
 
+def fingerprint_of(subject_refs) -> bytes:
+    """Cheap content hash of a subject set: O(n) rather than the O(n * DEPTH) a
+    full tree build costs. Sorted first, so it depends only on the SET, not on
+    input ordering (subject_refs typically comes from a numpy column, whose
+    iteration order is incidental).
+
+    Exists to answer one question safely: "does a cached tree still match what
+    is actually on disk right now?" -- see tree_for_shard below. A wrong answer
+    here would mean an incremental removal starts from the wrong base tree and
+    produces a root that does not match reality, so this has to be cheap enough
+    to run on every rebuild rather than something a caller is tempted to skip.
+    """
+    return sha256(b"".join(_keys(subject_refs))).digest()
+
+
 # A materialised node: (hash, left, right, singleton_key).
 #   internal  -> (h, left, right, None)
 #   singleton -> (h, None, None, key)      one key occupies this whole subtree
@@ -96,6 +111,34 @@ def _build(keys: list[bytes], depth: int):
     left = _build([k for k in keys if _bit(k, depth) == 0], depth + 1)
     right = _build([k for k in keys if _bit(k, depth) == 1], depth + 1)
     return (_node(left[0], right[0]), left, right, None)
+
+
+def _remove_key(node, target: bytes, depth: int):
+    """Delete `target` from the subtree `node` starting at `depth`; return the
+    resulting node. Recombines with `_node()` on the way back up, so the
+    result is bit-for-bit what `_build` would have produced over the same
+    surviving keys -- verified directly in tests/unit/test_smt.py rather than
+    assumed from the reasoning.
+
+    Deliberately does not re-collapse a two-key subtree into a fresh singleton
+    node once it drops to one key: the untouched sibling is passed through
+    exactly as it was (already a singleton if `_build` made it one), so no
+    extra depth is walked on a later call, and the hash is identical either
+    way -- `_node()` depends only on child hashes, not on how a child got
+    materialised. Collapsing would be representation tidiness with no effect
+    on correctness or on the cost of anything that walks this tree afterward.
+    """
+    _, left, right, key = node
+    if left is not None:
+        if _bit(target, depth) == 0:
+            new_left = _remove_key(left, target, depth + 1)
+            return (_node(new_left[0], right[0]), new_left, right, None)
+        new_right = _remove_key(right, target, depth + 1)
+        return (_node(left[0], new_right[0]), left, new_right, None)
+    if key == target:
+        return (DEFAULTS[depth], None, None, None)
+    raise ValueError(f"{target.hex()[:12]}... not present at depth {depth} -- "
+                     f"caller should have checked _present first")
 
 
 class SparseMerkleTree:
@@ -127,9 +170,58 @@ class SparseMerkleTree:
         self._present = set(self._keys)
         self._root = _build(self._keys, 0)
 
+    @classmethod
+    def _from_parts(cls, keys: list[bytes], root) -> "SparseMerkleTree":
+        """Construct directly from an already-sorted key list and a built root,
+        skipping `_build`. Used by `remove` below, which computes both without
+        a full rebuild."""
+        self = cls.__new__(cls)
+        self._keys = keys
+        self._present = set(keys)
+        self._root = root
+        return self
+
     @property
     def root(self) -> str:
         return self._root[0].hex()
+
+    @property
+    def fingerprint(self) -> bytes:
+        """Cheap identity of the exact key set this tree was built over. See
+        `fingerprint_of` -- this is the same computation, just skipping the
+        sort since `self._keys` already is one."""
+        return sha256(b"".join(self._keys)).digest()
+
+    def remove(self, refs: list[str]) -> "SparseMerkleTree":
+        """A new tree with `refs` deleted, touching only their paths.
+
+        This is the whole point of persisting a tree across rebuilds instead
+        of building fresh each time: deleting k keys out of n costs
+        O(k * DEPTH) -- walk to each key's existing position and recombine on
+        the way back -- rather than O(n * DEPTH) for rebuilding every key's
+        singleton chain from scratch. At 276,075 keys that is the difference
+        between ~65M SHA-256 calls and roughly 256 per erased subject.
+
+        Raises ValueError if any ref is not present, rather than silently
+        producing a tree that still reflects it -- a caller passing an
+        already-purged or misspelled ref has a bug upstream, and a manifest
+        built from the wrong root is the worst way to find out.
+        """
+        targets = [bytes.fromhex(r) for r in refs]
+        for ref, target in zip(refs, targets):
+            if target not in self._present:
+                raise ValueError(f"{ref[:12]}... is not present; cannot remove")
+
+        root = self._root
+        removed = set()
+        for target in targets:
+            if target in removed:
+                continue
+            root = _remove_key(root, target, 0)
+            removed.add(target)
+
+        new_keys = [k for k in self._keys if k not in removed]
+        return SparseMerkleTree._from_parts(new_keys, root)
 
     def prove_absence(self, target_ref: str) -> dict:
         """Walk down the built tree collecting sibling subtree hashes.
@@ -168,6 +260,51 @@ class SparseMerkleTree:
             break
 
         return {"scheme": "smt-256", "siblings": siblings}
+
+
+_tree_cache: dict[int, SparseMerkleTree] = {}
+# No lock: the only caller is worker/jobs.py::process_claimed, which the
+# worker's poll loop (worker/main.py) runs strictly sequentially -- one claimed
+# batch at a time, never concurrently within a process. Add one if that
+# changes; a global dict written from multiple threads without one is a real
+# bug, just not one this call pattern can hit today.
+
+
+def tree_for_shard(shard: int, current_subject_refs) -> SparseMerkleTree:
+    """The tree to build `.remove(purged_refs)` from: the cached one if it
+    still matches what is actually on disk for this shard, a fresh full build
+    otherwise.
+
+    The validation is what makes this safe under the worker's actual
+    concurrency model -- `worker/queue.py::claim_batch` uses `FOR UPDATE SKIP
+    LOCKED` with no shard-level exclusivity, so nothing here can assume this
+    process was the last one to touch this shard. A stale or missing cache
+    entry costs one full rebuild, exactly today's behaviour; a wrong ANSWER
+    would mean an absence proof issued against a root that does not describe
+    what is actually on disk, which is not a cost this trades away for speed.
+    """
+    fp = fingerprint_of(current_subject_refs)
+    cached = _tree_cache.get(shard)
+    if cached is not None and cached.fingerprint == fp:
+        return cached
+    return SparseMerkleTree(current_subject_refs)
+
+
+def cache_tree(shard: int, tree: SparseMerkleTree) -> None:
+    """Record `tree` as the last-known-good tree for `shard`, for the next
+    call to `tree_for_shard`. Callers pass the tree AFTER their purge, so the
+    cache always holds the state that matches the shard file on disk right
+    now -- not the state mid-rebuild."""
+    _tree_cache[shard] = tree
+
+
+def clear_tree_cache() -> None:
+    """Test isolation, mirroring inference.batched_ensemble.clear_cache: a
+    stale entry from one test would otherwise be a silent cache HIT for the
+    next test that happens to reuse the same shard number with different
+    subject_refs -- caught by the fingerprint check either way, but clearing
+    keeps tests from relying on that safety net to pass."""
+    _tree_cache.clear()
 
 
 def build_root(subject_refs) -> str:
