@@ -16,9 +16,8 @@ from fastapi.testclient import TestClient
 from nacl.signing import SigningKey
 
 from config.settings import CODE_DIGEST, NUM_SHARDS, NUM_SLICES, subject_ref
-from engine import rebuild as rebuild_mod
 from engine import train as train_mod
-from gateway.routes import predict as predict_mod
+from tests.conftest import override_checkpoint_dir, override_shard_dir
 from verify.verifier_cli import verify_certificate
 
 
@@ -40,10 +39,8 @@ def corpus(tmp_path, monkeypatch, pg):
     same two steps `engine.train --build` + `scripts.load_routing` perform,
     just pointed at a temp directory instead of the repo's real one."""
     shard_dir, ckpt_dir = str(tmp_path / "shards"), str(tmp_path / "ckpt")
-    monkeypatch.setattr(train_mod, "SHARD_DIR", shard_dir)
-    monkeypatch.setattr(train_mod, "CHECKPOINT_DIR", ckpt_dir)
-    monkeypatch.setattr(rebuild_mod, "SHARD_DIR", shard_dir)
-    monkeypatch.setattr(predict_mod, "CHECKPOINT_DIR", ckpt_dir)
+    override_shard_dir(monkeypatch, shard_dir)
+    override_checkpoint_dir(monkeypatch, ckpt_dir)
 
     n_subjects = 150
     routing = train_mod.build(n_subjects=n_subjects, seed=11)

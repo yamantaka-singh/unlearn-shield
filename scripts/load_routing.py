@@ -8,34 +8,20 @@ than touching Postgres directly because it is offline and network-free by
 design (see engine/train.py); the DB is Phase 4's, and this script is the seam.
 """
 
-import os
-import shutil
 from hashlib import sha256
 
 from psycopg2.extras import Json, execute_values
 
-from config.settings import CHECKPOINT_DIR, CODE_DIGEST, NUM_SHARDS, NUM_SLICES
+from config.settings import CODE_DIGEST, NUM_SHARDS, NUM_SLICES
 from db.conn import connect
-from engine.train import checkpoint_path, load_routing
+from engine import active
+from engine.train import load_routing
 from worker.jobs import record_eval
 
 
 def _file_hash(path: str) -> str:
     with open(path, "rb") as f:
         return sha256(f.read()).hexdigest()
-
-
-def _cas_copy(source: str, digest: str) -> str:
-    """Same reasoning as worker/jobs.py::_promote: engine/train.py writes each
-    slice to a fixed (shard, slice_idx) path that the next rebuild overwrites,
-    so the DB's file_path must point at a content-addressed copy or it goes
-    stale the moment this shard is rebuilt for the first time."""
-    cas_dir = os.path.join(CHECKPOINT_DIR, "cas")
-    os.makedirs(cas_dir, exist_ok=True)
-    cas_path = os.path.join(cas_dir, f"{digest}.pt")
-    if not os.path.exists(cas_path):
-        shutil.copyfile(source, cas_path)
-    return cas_path
 
 
 def main() -> int:
@@ -54,9 +40,12 @@ def main() -> int:
 
             shard_checkpoints = {}
             for shard in range(NUM_SHARDS):
-                path = checkpoint_path(shard, NUM_SLICES - 1)
+                # Whichever engine is active: its live model at the mutable
+                # conventional path, hashed, then copied content-addressed so
+                # the DB's file_path survives this shard's first rebuild.
+                path, _ = active.live_model_path(shard)
                 digest = _file_hash(path)
-                cas_path = _cas_copy(path, digest)
+                cas_path = active.promote_artifact(shard, digest)
                 cur.execute("""
                     INSERT INTO checkpoints (checkpoint_hash, shard, slice_idx, file_path, code_digest)
                     VALUES (%s, %s, %s, %s, %s)

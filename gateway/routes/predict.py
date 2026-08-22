@@ -18,13 +18,13 @@ project exists to prevent.
 import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
-from config.settings import CHECKPOINT_DIR, DISAGREEMENT_THRESHOLD
+from config.settings import DISAGREEMENT_THRESHOLD
 from data.synth import TYPES
 from db.conn import pooled
+from engine import active
 from gateway import disagreement
 from gateway.auth import require_scope
 from gateway.schemas import PredictRequest, PredictResponse
-from inference.batched_ensemble import load_ensemble
 
 router = APIRouter(prefix="/v1", tags=["predict"])
 
@@ -59,8 +59,7 @@ def predict(body: PredictRequest, background: BackgroundTasks,
         with conn.cursor() as cur:
             model_version, shard_paths = _current_model(cur)
 
-    preproc_paths = {s: f"{CHECKPOINT_DIR}/shard{s}_preproc.json" for s in shard_paths}
-    ensemble = load_ensemble(shard_paths, preproc_paths)
+    ensemble = active.load_ensemble(shard_paths)
 
     record = {
         "step": np.array([body.step]),

@@ -113,6 +113,66 @@ def load_ensemble(shard_paths: dict, preproc_paths: dict) -> ShardEnsemble:
         return _cache[key]
 
 
+class GBDTEnsemble:
+    """The tree counterpart to ShardEnsemble. Same two methods, same shapes, so
+    every caller (gateway/routes/predict.py, worker/jobs.py::record_eval) works
+    against either without knowing which is loaded.
+
+    One structural difference is worth stating, because it runs the opposite way
+    to the MLP path's docstring above. Batching there is held back by ADR 0004:
+    per-shard preprocessing means S scaled copies of the input, so the promised
+    S-times saving is partly spent building them. Trees fit nothing per shard
+    (engine/gbdt.py::features), so there is exactly ONE feature matrix and one
+    DMatrix, built once and scored by every shard's booster. The saving the
+    plan predicted for the MLP is real here instead.
+    """
+
+    def __init__(self, boosters: list):
+        if not boosters:
+            raise ValueError("GBDTEnsemble needs at least one shard booster")
+        self.boosters = boosters
+
+    def shard_probabilities(self, records: dict, rows: np.ndarray) -> np.ndarray:
+        """Per-shard probability, shape [n_shards, n_rows]."""
+        import xgboost as xgb
+
+        from engine.gbdt import features
+        matrix = xgb.DMatrix(features(records, rows))
+        return np.stack([b.predict(matrix) for b in self.boosters])
+
+    def predict_proba(self, records: dict, rows: np.ndarray) -> np.ndarray:
+        return self.shard_probabilities(records, rows).mean(axis=0)
+
+
+def load_gbdt_ensemble(shard_paths: dict) -> GBDTEnsemble:
+    """`shard_paths` maps shard index (as str) -> booster file path, from the
+    DB's `checkpoints.file_path` exactly as load_ensemble's do.
+
+    Shares `_cache` with the MLP path rather than keeping its own, so
+    `clear_cache()` stays the single place that forgets a model. The key is
+    tagged with the engine name: a deployment only runs one of the two (ADR
+    0011), but a test process exercising both must not have one's entry
+    answer for the other's identical-looking path tuple.
+    """
+    key = ("gbdt",) + tuple(sorted(shard_paths.items()))
+    with _cache_lock:
+        hit = _cache.get(key)
+    if hit is not None:
+        return hit
+
+    import xgboost as xgb
+    boosters = []
+    for shard in sorted(shard_paths, key=int):
+        booster = xgb.Booster()
+        booster.load_model(shard_paths[shard])
+        boosters.append(booster)
+
+    ensemble = GBDTEnsemble(boosters)
+    with _cache_lock:
+        _cache.setdefault(key, ensemble)
+        return _cache[key]
+
+
 def clear_cache() -> None:
     with _cache_lock:
         _cache.clear()

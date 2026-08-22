@@ -8,8 +8,6 @@ a multi-minute rebuild never holds a Postgres transaction open.
 import hashlib
 import hmac
 import logging
-import os
-import tempfile
 from itertools import groupby
 
 import numpy as np
@@ -18,9 +16,7 @@ import psycopg2.extras
 from config.settings import AUDIT_KEY, CODE_DIGEST, SPOT_CHECK_RATE
 from data.eval_set import auc as compute_auc
 from data.eval_set import load as load_eval_set
-from engine.rebuild import rebuild_batch_by_ref
-from engine.train import checkpoint_path, train_shard
-from inference.batched_ensemble import load_ensemble
+from engine import active
 
 
 def _should_spot_check(erasure_id: str) -> bool:
@@ -40,23 +36,16 @@ def _promote(cur, shard: int, result_weights: str) -> None:
     shard's current hash unchanged -- a rebuild of shard k must not silently
     drop shards it didn't touch from the promoted set.
 
-    The copy matters: engine/train.py writes each slice to a FIXED path keyed
-    only by (shard, slice_idx), because within one rebuild it needs a stable
-    name to resume from. But that means the next rebuild of this shard
-    overwrites those bytes -- so a checkpoints row from an earlier rebuild
-    would end up pointing at a file that no longer contains what its recorded
-    hash says it does. Copying into checkpoints/cas/{hash}.pt at promotion time
-    is what makes DB history actually retrievable rather than just recorded.
+    The copy matters, and it matters for whichever engine is active: each
+    writes its live model to a FIXED conventional path that the next rebuild of
+    the same shard overwrites, so a checkpoints row recorded against that path
+    would end up describing bytes that are no longer there. Which file gets
+    copied, and with what extension, is the engine's business --
+    engine/active.py::promote_artifact.
     """
-    import shutil
-    from engine.train import CHECKPOINT_DIR, NUM_SLICES
+    from config.settings import NUM_SLICES
 
-    source = checkpoint_path(shard, NUM_SLICES - 1)
-    cas_dir = os.path.join(CHECKPOINT_DIR, "cas")
-    os.makedirs(cas_dir, exist_ok=True)
-    cas_path = os.path.join(cas_dir, f"{result_weights}.pt")
-    if not os.path.exists(cas_path):
-        shutil.copyfile(source, cas_path)
+    cas_path = active.promote_artifact(shard, result_weights)
 
     cur.execute("""
         INSERT INTO checkpoints (checkpoint_hash, shard, slice_idx, file_path, code_digest)
@@ -84,21 +73,18 @@ def record_eval(cur, model_version: str, shard_checkpoints: dict) -> float:
     (scripts/load_routing.py), so the dashboard's delta chart has a baseline
     to compare the first real rebuild against.
 
-    Real, not fabricated: it runs the actual promoted checkpoints through
-    inference.batched_ensemble against data/eval_set.py's frozen corpus. A
+    Real, not fabricated: it runs the actual promoted checkpoints through the
+    active engine's ensemble against data/eval_set.py's frozen corpus. A
     Phase 6 "accuracy chart" backed by invented numbers would be exactly the
     kind of thing this project exists to catch someone else doing.
     """
-    from engine.train import CHECKPOINT_DIR
-
     cur.execute("SELECT shard, file_path FROM checkpoints WHERE checkpoint_hash = ANY(%s)",
                (list(shard_checkpoints.values()),))
     shard_paths = {str(shard): path for shard, path in cur.fetchall()}
-    preproc_paths = {s: os.path.join(CHECKPOINT_DIR, f"shard{s}_preproc.json") for s in shard_paths}
 
     records = load_eval_set()
     rows = np.arange(len(records["step"]))
-    ensemble = load_ensemble(shard_paths, preproc_paths)
+    ensemble = active.load_ensemble(shard_paths)
     probs = ensemble.predict_proba(records, rows)
     score = compute_auc(records["isFraud"], probs)
 
@@ -121,10 +107,8 @@ def run_spot_check(cur, erasure_id: str, shard: int, replay: dict,
     moment the inputs are still exactly what the manifest describes; a later
     rebuild of the same shard would move them.
 
-    Writes into a temporary directory, never the real checkpoint paths.
-    Overwriting them would be harmless when the check passes and actively
-    destructive when it fails -- leaving the next rebuild to resume from
-    divergent weights that match no recorded hash.
+    Never writes over the real model, whichever engine is active -- see
+    engine/active.py::replay_digest for how each avoids it.
 
     What this proves: the rebuild is reproducible, so nondeterminism has not
     crept in via a thread-count change, a library upgrade, or a DataLoader
@@ -132,12 +116,7 @@ def run_spot_check(cur, erasure_id: str, shard: int, replay: dict,
     honestly -- running the same code twice agrees with itself either way.
     That gap is the one ADR 0002 records against `code_digest`.
     """
-    with tempfile.TemporaryDirectory(prefix="unlearnshield-spotcheck-") as scratch:
-        digests = train_shard(shard, records=replay["records"],
-                              from_slice=replay["from_slice"],
-                              resume_state=replay["resume_state"],
-                              seed=replay["seed"], checkpoint_dir=scratch)
-    observed = digests[max(digests)]
+    observed = active.replay_digest(shard, replay)
     matched = observed == expected_weights
 
     cur.execute("""
@@ -166,7 +145,7 @@ def process_claimed(cur, jobs: list[dict]) -> None:
         group = list(group)
         refs = [j["subject_ref"] for j in group]
         try:
-            result = rebuild_batch_by_ref(refs)
+            result = active.rebuild_batch_by_ref(refs)
         except Exception as exc:
             # Nothing offline has happened yet at this point -- purge/retrain
             # is the first thing rebuild_batch_by_ref does -- so 'failed' here

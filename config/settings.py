@@ -31,6 +31,22 @@ LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "1e-3"))
 SHARD_DIR = os.environ.get("SHARD_DIR", "data/shards")
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "checkpoints")
 
+# Which model this deployment trains, serves, and rebuilds: "mlp" or "gbdt".
+#
+# A deployment-wide switch, not a per-request one. ADR 0011 established that
+# the two engines are alternatives rather than a hybrid, and the reason is
+# concrete rather than stylistic: both pop rows from the same routing.json and
+# purge the same shard files, so running them together against one SHARD_DIR
+# would have each engine's rebuild delete the other's routing entry. Anything
+# that let both answer at once would need two routing tables and two shard
+# directories -- a real design decision, deliberately not made here.
+MODEL_ENGINE = os.environ.get("MODEL_ENGINE", "mlp")
+if MODEL_ENGINE not in ("mlp", "gbdt"):
+    # Loud at import, not at the first rebuild: a typo'd MODEL_ENGINE that
+    # fell through to a default would train one model and issue manifests
+    # describing another.
+    raise ValueError(f"MODEL_ENGINE must be 'mlp' or 'gbdt', got {MODEL_ENGINE!r}")
+
 
 def subject_ref(subject_id: str) -> str:
     """The only form a subject identifier takes past ingest.

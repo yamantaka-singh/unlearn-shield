@@ -17,7 +17,7 @@ from nacl.signing import SigningKey
 from config.settings import CODE_DIGEST, NUM_SHARDS, NUM_SLICES, subject_ref
 from engine import rebuild as rebuild_mod
 from engine import train as train_mod
-from gateway.routes import predict as predict_mod
+from tests.conftest import override_checkpoint_dir, override_shard_dir
 
 
 @pytest.fixture
@@ -37,10 +37,8 @@ def client(pg, monkeypatch):
 def corpus(tmp_path, monkeypatch, pg):
     """A promoted model plus one completed erasure with a real certificate."""
     shard_dir, ckpt_dir = str(tmp_path / "shards"), str(tmp_path / "ckpt")
-    monkeypatch.setattr(train_mod, "SHARD_DIR", shard_dir)
-    monkeypatch.setattr(train_mod, "CHECKPOINT_DIR", ckpt_dir)
-    monkeypatch.setattr(rebuild_mod, "SHARD_DIR", shard_dir)
-    monkeypatch.setattr(predict_mod, "CHECKPOINT_DIR", ckpt_dir)
+    override_shard_dir(monkeypatch, shard_dir)
+    override_checkpoint_dir(monkeypatch, ckpt_dir)
 
     key = SigningKey.generate()
     monkeypatch.setenv("UNLEARNSHIELD_SIGNING_KEY", bytes(key).hex())

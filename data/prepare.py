@@ -16,9 +16,19 @@ import numpy as np
 from data.synth import TYPES
 
 
-def load(path: str) -> dict:
+def load(path: str, max_rows: int | None = None) -> dict:
     """Streams the CSV once rather than going through pandas -- one pass, no
     intermediate DataFrame, and no new dependency for a job this stdlib-shaped.
+
+    `max_rows` stops after the first N data rows, without reading the rest of
+    the file. Note what that is and is not: PaySim is ordered by `step`, so a
+    prefix is the first N hours of the simulation -- a TEMPORAL sample, which
+    is what scripts/benchmark.py wants so it can split train/test on time. It
+    is not a representative sample of the whole file, and `main()` below
+    deliberately does the other thing (a random subsample across all rows) for
+    the cases that need one. Picking the wrong one silently changes what a
+    measurement means, so they are kept as separate, named behaviours rather
+    than one flag.
     """
     type_index = {t: i for i, t in enumerate(TYPES)}
     cols = {k: [] for k in ("nameOrig", "step", "type_idx", "amount",
@@ -27,7 +37,9 @@ def load(path: str) -> dict:
 
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        for i, row in enumerate(reader):
+            if max_rows is not None and i >= max_rows:
+                break
             cols["nameOrig"].append(row["nameOrig"])
             cols["step"].append(float(row["step"]))
             cols["type_idx"].append(type_index[row["type"]])

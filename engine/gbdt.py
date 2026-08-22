@@ -233,6 +233,12 @@ def rebuild_batch_by_ref(refs: list, trees_per_slice: int = TREES_PER_SLICE,
                                        trees_per_slice=trees_per_slice)
     save_shard(shard, retained)
     save_booster(rebuilt, shard)
+    # Recomputed rather than returned out of rebuild_booster: `rollback` is
+    # pure (`booster[0:n]` builds a new Booster, it does not mutate), so this
+    # is the identical object rebuild_booster trained from, and taking it here
+    # keeps rebuild_booster's signature -- which the unit tests drive directly
+    # against in-memory shards -- unchanged.
+    resume_booster = rollback(booster, min_slice, trees_per_slice)
 
     result_weights = sha256(rebuilt.save_raw(raw_format="json")).hexdigest()
     resumed_from = f"slice{min_slice - 1}" if min_slice > 0 else "fresh_init"
@@ -268,9 +274,33 @@ def rebuild_batch_by_ref(refs: list, trees_per_slice: int = TREES_PER_SLICE,
         "shard": shard,
         "resumed_from": resumed_from,
         "rows_purged": len(records["subject_ref"]) - len(retained["subject_ref"]),
+        "slices_retrained": list(range(min_slice, NUM_SLICES)),
         "result_weights": result_weights,
         "manifests": manifests,
+        # Same shape and same purpose as engine/rebuild.py's `replay`: enough
+        # to re-run this exact rebuild for the reproducibility spot-check,
+        # captured at the only moment the inputs still match what the manifest
+        # describes. `resume_booster` stands where the MLP path puts
+        # `resume_state` -- for trees the resume point is a truncated model
+        # rather than a loaded checkpoint, which is the whole of ADR 0011.
+        "replay": {"records": retained, "from_slice": min_slice,
+                   "resume_booster": resume_booster,
+                   "trees_per_slice": trees_per_slice, "seed": SEED},
     }
+
+
+def replay_digest(shard: int, replay: dict) -> str:
+    """Re-run a rebuild from its `replay` payload and return the weight digest.
+
+    The GBDT counterpart to re-running engine.train.train_shard in a scratch
+    directory. Nothing is written: a booster is one in-memory object, so the
+    MLP path's careful "never overwrite the promoted checkpoint" temporary
+    directory has no equivalent hazard to guard against here.
+    """
+    rebuilt = train_shard(shard, replay["records"], from_slice=replay["from_slice"],
+                          booster=replay["resume_booster"],
+                          trees_per_slice=replay["trees_per_slice"])
+    return sha256(rebuilt.save_raw(raw_format="json")).hexdigest()
 
 
 def rebuild_batch(subject_ids: list, **kwargs) -> dict:

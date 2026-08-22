@@ -58,6 +58,64 @@ def auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float((rank_sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
+def average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Area under the precision-recall curve, the step-interpolated form
+    (sum of precision at each threshold, weighted by the recall it gains).
+
+    This, not ROC-AUC, is the metric that carries information at fraud
+    prevalence. ROC-AUC's denominator is the negative class, and when 99.9% of
+    rows are negative a model can rank almost every negative correctly, score
+    0.99, and still be useless -- the false positives it does produce swamp the
+    ~0.1% of rows that are actually fraud. Average precision is scored against
+    the positives instead, so its baseline is the prevalence itself: a random
+    model scores ~0.001 here, where it scores 0.5 on ROC-AUC. That difference
+    is the whole reason this function exists alongside `auc` rather than
+    instead of it -- both are reported, and only one of them moves when the
+    model is genuinely good at the rare class.
+
+    Returns 0.0 if there are no positives: undefined, and 0.0 is the reading
+    that cannot be mistaken for success.
+    """
+    y_true = np.asarray(y_true, dtype=bool)
+    n_pos = int(y_true.sum())
+    if n_pos == 0:
+        return 0.0
+    # Descending score; ties broken deterministically so the number is stable.
+    order = np.argsort(-y_score, kind="mergesort")
+    hits = y_true[order]
+    tp = np.cumsum(hits)
+    precision = tp / np.arange(1, len(hits) + 1)
+    # Only the ranks where a positive is retrieved gain recall, so only those
+    # contribute -- each by 1/n_pos of the curve.
+    return float(precision[hits].sum() / n_pos)
+
+
+def precision_at_recall(y_true: np.ndarray, y_score: np.ndarray, target: float) -> dict:
+    """Precision achievable while catching `target` of the fraud, plus the
+    alert volume that costs.
+
+    The operational question a fraud team actually asks, and the one neither
+    AUC answers: "if I must catch 80% of fraud, how many alerts do I review per
+    true one?" `alerts_per_catch` is the inverse of precision, reported because
+    a review queue is staffed in alerts, not in percentages.
+    """
+    y_true = np.asarray(y_true, dtype=bool)
+    n_pos = int(y_true.sum())
+    if n_pos == 0:
+        return {"recall_target": target, "precision": 0.0, "alerts_per_catch": None,
+                "flagged": 0, "flagged_fraction": 0.0}
+    order = np.argsort(-y_score, kind="mergesort")
+    hits = y_true[order]
+    tp = np.cumsum(hits)
+    # First rank at which cumulative recall reaches the target.
+    k = int(np.searchsorted(tp, np.ceil(target * n_pos))) + 1
+    k = min(k, len(hits))
+    precision = float(tp[k - 1] / k)
+    return {"recall_target": target, "precision": precision,
+            "alerts_per_catch": (1.0 / precision) if precision > 0 else None,
+            "flagged": k, "flagged_fraction": k / len(hits)}
+
+
 if __name__ == "__main__":
     d = load()
     print(f"{len(d['step'])} rows, {d['isFraud'].sum()} fraud, "
@@ -66,4 +124,18 @@ if __name__ == "__main__":
         "a perfect score must rank every fraud row above every non-fraud row"
     assert abs(auc(d["isFraud"], np.zeros(len(d["isFraud"]))) - 0.5) < 1e-9, \
         "no signal must score exactly chance"
-    print("self-check passed")
+
+    y = d["isFraud"].astype(bool)
+    assert abs(average_precision(y, y.astype(float)) - 1.0) < 1e-9, \
+        "a perfect ranking must have average precision 1"
+    # The property that motivates reporting it: with no signal, AP falls to the
+    # prevalence while AUC sits at a reassuring 0.5.
+    rng = np.random.default_rng(0)
+    noise_ap = average_precision(y, rng.random(len(y)))
+    prevalence = y.mean()
+    assert abs(noise_ap - prevalence) < 5 * prevalence, \
+        f"random-ranking AP {noise_ap:.4f} should sit near prevalence {prevalence:.4f}"
+
+    perfect = precision_at_recall(y, y.astype(float), 0.8)
+    assert perfect["precision"] == 1.0, "a perfect ranking needs no false positives"
+    print(f"self-check passed (prevalence {prevalence:.4f}, random-ranking AP {noise_ap:.4f})")

@@ -43,6 +43,28 @@ def override_shard_dir(monkeypatch, shard_dir: str) -> None:
         monkeypatch.setattr(mod, "SHARD_DIR", shard_dir)
 
 
+def override_checkpoint_dir(monkeypatch, checkpoint_dir: str) -> None:
+    """The CHECKPOINT_DIR counterpart to override_shard_dir, and it exists for
+    the same reason -- but note the module list is DIFFERENT, which is exactly
+    why one combined helper would be wrong.
+
+    `engine.active` was added when the GBDT engine was wired into the gateway
+    and worker, and it holds its own CHECKPOINT_DIR for the CAS directory and
+    the MLP's preprocessor paths. It took over that binding from
+    `gateway.routes.predict`, which no longer has one at all -- so every
+    fixture that patched `predict_mod.CHECKPOINT_DIR` broke loudly with an
+    AttributeError the moment the wiring landed. Loud is the good case; the
+    bad case is the silent one this module keeps producing, where a stale
+    binding reads real files and nothing errors.
+
+    Keep in sync with `grep -rn "CHECKPOINT_DIR" --include=*.py engine/ gateway/ worker/`.
+    """
+    import engine.active as active_mod
+    import engine.train as train_mod
+    for mod in (train_mod, active_mod):
+        monkeypatch.setattr(mod, "CHECKPOINT_DIR", checkpoint_dir)
+
+
 # Every table, so a case never inherits another's rows. eval_results was
 # already being cleared by CASCADE through its model_versions foreign key;
 # disagreement_reviews has no FK, so it genuinely leaked rows between tests
